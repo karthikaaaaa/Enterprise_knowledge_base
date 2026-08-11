@@ -17,7 +17,7 @@ export async function POST(request: Request) {
 
     const safeName = file.name.replace(/[^a-zA-Z0-9._-]/g, '-').toLowerCase()
     const blob = await put(`knowledge-base/${Date.now()}-${safeName}`, file, {
-      access: 'private',
+      access: 'public',
       addRandomSuffix: false,
       contentType: file.type || 'application/octet-stream',
     })
