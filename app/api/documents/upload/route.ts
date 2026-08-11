@@ -1,12 +1,13 @@
-import { put } from '@vercel/blob'
+import { del, put } from '@vercel/blob'
 import { NextResponse } from 'next/server'
+import { insertDocument, toApiDocument } from '@/lib/db/documents'
 
 export async function POST(request: Request) {
   try {
     const formData = await request.formData()
     const file = formData.get('file')
     const department = String(formData.get('department') ?? 'Policies')
-    const access = String(formData.get('access') ?? 'All employees')
+    const uploadedBy = formData.get('uploadedBy') ? String(formData.get('uploadedBy')) : null
 
     if (!(file instanceof File)) {
       return NextResponse.json({ error: 'No file provided' }, { status: 400 })
@@ -22,32 +23,26 @@ export async function POST(request: Request) {
       contentType: file.type || 'application/octet-stream',
     })
 
-    return NextResponse.json({
-      id: `upload-${blob.pathname.replace(/^knowledge-base\//, '')}`,
-      name: file.name,
-      pathname: blob.pathname,
-      type: file.name.split('.').pop()?.toLowerCase() ?? 'file',
-      mimeType: file.type || 'application/octet-stream',
-      sizeBytes: file.size,
-      size: formatBytes(file.size),
-      uploadedAt: new Date().toISOString(),
-      department,
-      access,
-      pages: 1,
-      owner: 'Amara Okafor',
-      pinned: false,
-      indexed: false,
-      summary: 'Newly uploaded document. AI indexing will be available after processing.',
-      tags: ['New upload'],
-    })
+    const fileType = file.name.split('.').pop()?.toLowerCase() ?? 'file'
+
+    try {
+      const row = await insertDocument({
+        filename: blob.pathname,
+        originalFilename: file.name,
+        fileType,
+        fileSize: file.size,
+        blobUrl: blob.pathname,
+        department,
+        uploadedBy,
+      })
+      return NextResponse.json(toApiDocument(row))
+    } catch (dbError) {
+      // Roll back the blob so we don't leave an orphaned file that never shows up in the UI.
+      await del(blob.pathname).catch(() => {})
+      throw dbError
+    }
   } catch (error) {
     console.error('[v0] Document upload failed:', error)
     return NextResponse.json({ error: 'Upload failed. Please try again.' }, { status: 500 })
   }
-}
-
-function formatBytes(bytes: number) {
-  if (bytes < 1024) return `${bytes} B`
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
 }

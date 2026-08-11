@@ -3,10 +3,12 @@
 import { useEffect, useState } from 'react'
 import { X, UploadCloud, Sparkles, FileText, CheckCircle2, Loader2 } from 'lucide-react'
 import { departments } from '@/lib/documents'
+import { useAuth } from '@/components/auth/auth-provider'
 
-type UploadedDocument = { id: string; name: string; size: string; type: string; pathname: string; mimeType: string; uploadedAt: string; department: string; access: string }
+type UploadedDocument = { id: string; name: string; size: string; type: string; pathname: string; mimeType: string; uploadedAt: string; department: string }
 
 export function UploadModal({ open, onClose, onUploaded }: { open: boolean; onClose: () => void; onUploaded?: (doc: UploadedDocument) => void }) {
+  const { user } = useAuth()
   const [file, setFile] = useState<File | null>(null)
   const [preview, setPreview] = useState('')
   const [department, setDepartment] = useState(departments[0])
@@ -32,6 +34,7 @@ export function UploadModal({ open, onClose, onUploaded }: { open: boolean; onCl
     setUploading(true); setError('')
     const body = new FormData()
     body.append('file', file); body.append('department', department); body.append('access', access)
+    if (user?.name) body.append('uploadedBy', user.name)
     try {
       const response = await fetch('/api/documents/upload', { method: 'POST', body })
       const data = await response.json()
