@@ -1,12 +1,17 @@
-import { put } from '@vercel/blob'
 import { NextResponse } from 'next/server'
+import { saveFile } from '@/lib/storage'
+import { addDocument, mapToApiDocument } from '@/lib/document-store'
+import { indexDocument } from '@/lib/rag'
+import type { Department } from '@/lib/documents'
 
 export async function POST(request: Request) {
   try {
     const formData = await request.formData()
     const file = formData.get('file')
-    const department = String(formData.get('department') ?? 'Policies')
+    const department = String(formData.get('department') ?? 'Policies') as Department
     const access = String(formData.get('access') ?? 'All employees')
+    const uploadedByRaw = formData.get('uploadedBy')
+    const uploadedBy = typeof uploadedByRaw === 'string' && uploadedByRaw.trim() ? uploadedByRaw.trim() : 'Unknown uploader'
 
     if (!(file instanceof File)) {
       return NextResponse.json({ error: 'No file provided' }, { status: 400 })
@@ -15,39 +20,26 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: 'File must be 25 MB or smaller' }, { status: 413 })
     }
 
-    const safeName = file.name.replace(/[^a-zA-Z0-9._-]/g, '-').toLowerCase()
-    const blob = await put(`knowledge-base/${Date.now()}-${safeName}`, file, {
-      access: 'private',
-      addRandomSuffix: false,
-      contentType: file.type || 'application/octet-stream',
-    })
+    const buffer = Buffer.from(await file.arrayBuffer())
+    const { storedFilename, size } = await saveFile(buffer, file.name)
 
-    return NextResponse.json({
-      id: `upload-${blob.pathname.replace(/^knowledge-base\//, '')}`,
-      name: file.name,
-      pathname: blob.pathname,
-      type: file.name.split('.').pop()?.toLowerCase() ?? 'file',
+    const record = await addDocument({
+      originalName: file.name,
+      storedFilename,
+      filePath: `storage/documents/${storedFilename}`,
       mimeType: file.type || 'application/octet-stream',
-      sizeBytes: file.size,
-      size: formatBytes(file.size),
-      uploadedAt: new Date().toISOString(),
+      size,
       department,
       access,
-      pages: 1,
-      owner: 'Amara Okafor',
-      pinned: false,
-      indexed: false,
-      summary: 'Newly uploaded document. AI indexing will be available after processing.',
-      tags: ['New upload'],
+      uploadedBy,
     })
+
+    // Fire-and-forget: index for chat search without delaying the upload response.
+    indexDocument(record).catch((error) => console.error('[v0] Background indexing failed:', error))
+
+    return NextResponse.json(mapToApiDocument(record))
   } catch (error) {
     console.error('[v0] Document upload failed:', error)
     return NextResponse.json({ error: 'Upload failed. Please try again.' }, { status: 500 })
   }
-}
-
-function formatBytes(bytes: number) {
-  if (bytes < 1024) return `${bytes} B`
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
 }

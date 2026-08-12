@@ -1,24 +1,25 @@
-import { get } from '@vercel/blob'
 import { NextResponse } from 'next/server'
+import { getFile } from '@/lib/storage'
+import { listDocuments } from '@/lib/document-store'
 
 export async function GET(request: Request) {
   const pathname = new URL(request.url).searchParams.get('pathname')
   if (!pathname) return NextResponse.json({ error: 'Missing pathname' }, { status: 400 })
 
   try {
-    const result = await get(pathname, { access: 'private' })
-    if (!result) return new NextResponse('Not found', { status: 404 })
-    return new NextResponse(result.stream, {
+    const docs = await listDocuments()
+    const record = docs.find((doc) => doc.storedFilename === pathname)
+    const buffer = await getFile(pathname)
+    return new NextResponse(buffer, {
       headers: {
-        'Content-Type': result.blob.contentType ?? 'application/octet-stream',
-        'Content-Length': String(result.blob.size ?? ''),
-        ETag: result.blob.etag,
+        'Content-Type': record?.mimeType ?? 'application/octet-stream',
+        'Content-Length': String(buffer.byteLength),
         'Cache-Control': 'private, no-cache',
-        'Content-Disposition': `inline; filename="${pathname.split('/').pop() ?? 'document'}"`,
+        'Content-Disposition': `inline; filename="${record?.originalName ?? pathname}"`,
       },
     })
   } catch (error) {
-    console.error('[v0] Private file delivery failed:', error)
+    console.error('[v0] Local file delivery failed:', error)
     return NextResponse.json({ error: 'Unable to read file' }, { status: 404 })
   }
 }

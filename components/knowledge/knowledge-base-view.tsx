@@ -1,6 +1,6 @@
 'use client'
 
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import useSWR from 'swr'
 import Link from 'next/link'
 import {
@@ -14,15 +14,15 @@ import {
   ArrowUpRight,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
-import { documents, departments, type Department, type Document } from '@/lib/documents'
+import { type Department, type Document } from '@/lib/documents'
 import { DocIcon } from '@/components/knowledge/doc-icon'
 import { UploadModal } from '@/components/knowledge/upload-modal'
 import { useAuth } from '@/components/auth/auth-provider'
-import { canViewDocument } from '@/lib/document-access'
+import { canViewDocument, allowedDocumentDepartments } from '@/lib/document-access'
 
 type View = 'grid' | 'list'
 
-function DocCard({ doc, view }: { doc: (typeof documents)[number]; view: View }) {
+function DocCard({ doc, view }: { doc: Document; view: View }) {
   if (view === 'list') {
     return (
       <Link
@@ -88,20 +88,30 @@ const fetcher = (url: string) => fetch(url).then((response) => response.json())
 
 export function KnowledgeBaseView() {
   const { user } = useAuth()
-  const { data, mutate } = useSWR('/api/documents', fetcher, { fallbackData: documents })
-  const libraryDocuments = ((data ?? documents) as (Document & { pathname?: string; mimeType?: string })[]).filter((document) => canViewDocument(user, document))
+  const { data, mutate } = useSWR('/api/documents', fetcher)
+  const libraryDocuments = ((data ?? []) as (Document & { pathname?: string; mimeType?: string; visibleDepartments?: Department[] })[]).filter((document) => canViewDocument(user, document))
   const [query, setQuery] = useState('')
   const [filter, setFilter] = useState<Department | 'All'>('All')
   const [view, setView] = useState<View>('grid')
   const [uploadOpen, setUploadOpen] = useState(false)
 
+  // Section chips are scoped to what this role is allowed to browse by:
+  // admin/hr see every department, employees only see All + Policies, everyone
+  // else sees All + their own department + Policies.
+  const visibleChips = useMemo<(Department | 'All')[]>(() => ['All', ...allowedDocumentDepartments(user)], [user])
+
+  useEffect(() => {
+    if (!visibleChips.includes(filter)) setFilter('All')
+  }, [visibleChips, filter])
+
   const filtered = useMemo(() => {
     return libraryDocuments.filter((d) => {
-      const matchesFilter = filter === 'All' || d.department === filter
+      // "All employees" documents belong in every department section, not just their own.
+      const matchesFilter = filter === 'All' || d.department === filter || (d.visibleDepartments?.includes(filter) ?? false)
       const matchesQuery = d.name.toLowerCase().includes(query.toLowerCase())
       return matchesFilter && matchesQuery
     })
-  }, [query, filter])
+  }, [libraryDocuments, query, filter])
 
   const pinned = filtered.filter((d) => d.pinned)
   const recent = filtered
@@ -157,7 +167,7 @@ export function KnowledgeBaseView() {
       </div>
 
       <div className="flex flex-wrap items-center gap-2">
-        {(['All', ...departments] as const).map((chip) => (
+        {visibleChips.map((chip) => (
           <button
             key={chip}
             onClick={() => setFilter(chip)}
