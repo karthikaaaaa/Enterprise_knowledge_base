@@ -3,16 +3,29 @@
 import { createContext, useContext, useEffect, useMemo, useState, type ReactNode } from 'react'
 import { usePathname, useRouter } from 'next/navigation'
 
-export type Role = 'admin' | 'hr' | 'manager' | 'finance' | 'legal' | 'employee'
-export type DemoUser = { id: string; name: string; email: string; password: string; role: Role; department: string; title: string }
+export type Role = 'admin' | 'hr' | 'manager' | 'it' | 'finance' | 'legal' | 'employee'
+export type DemoUser = {
+  id: string
+  name: string
+  email: string
+  password: string
+  role: Role
+  department: string
+  title: string
+  /** Falls back to the shared generic avatar (/avatars/user.png) when not set. */
+  avatar?: string
+}
+
+export const DEFAULT_AVATAR = '/avatars/user.png'
 
 export const DEMO_USERS: DemoUser[] = [
   { id: 'amara', name: 'Amara Okafor', email: 'amara@knowledgeos.demo', password: 'Admin123!', role: 'admin', department: 'Operations', title: 'Workspace Admin' },
   { id: 'priya', name: 'Priya Nair', email: 'priya@knowledgeos.demo', password: 'HR123456!', role: 'hr', department: 'People Operations', title: 'HR Manager' },
   { id: 'diego', name: 'Diego Ramirez', email: 'diego@knowledgeos.demo', password: 'Manager123!', role: 'manager', department: 'Engineering', title: 'Engineering Manager' },
+  { id: 'rahul', name: 'Rahul Mehta', email: 'rahul@knowledgeos.demo', password: 'ITHead123!', role: 'it', department: 'IT', title: 'IT Head' },
   { id: 'fatima', name: 'Fatima Ali', email: 'fatima@knowledgeos.demo', password: 'Finance123!', role: 'finance', department: 'Finance', title: 'Finance Analyst' },
   { id: 'lucas', name: 'Lucas Meyer', email: 'lucas@knowledgeos.demo', password: 'Legal123!', role: 'legal', department: 'Legal', title: 'Legal Counsel' },
-  { id: 'elena', name: 'Elena Petrova', email: 'elena@knowledgeos.demo', password: 'Employee123!', role: 'employee', department: 'Product', title: 'Product Designer' },
+  { id: 'elena', name: 'Elena Petrova', email: 'elena@knowledgeos.demo', password: 'Employee123!', role: 'employee', department: 'Product', title: 'Product Designer', avatar: '/avatars/elena-petrova.png' },
   { id: 'james', name: 'James Okoro', email: 'james@knowledgeos.demo', password: 'Employee123!', role: 'employee', department: 'Engineering', title: 'Backend Engineer' },
   { id: 'mei', name: 'Mei Tanaka', email: 'mei@knowledgeos.demo', password: 'Employee123!', role: 'employee', department: 'Sales', title: 'Sales Manager' },
 ]

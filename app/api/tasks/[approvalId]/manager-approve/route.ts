@@ -1,0 +1,43 @@
+import { NextResponse } from 'next/server'
+import { getCaller } from '@/lib/server-auth'
+import { getTaskOwnership } from '@/lib/task-view'
+import { approveManagerAssignment, type ManagerReportError } from '@/lib/task-actions'
+
+const DEPARTMENT_ROLES = new Set(['IT', 'Finance', 'Legal', 'Manager'])
+
+const ERROR_STATUS: Record<ManagerReportError, number> = {
+  approval_not_found: 404,
+  wrong_step: 400,
+  approval_locked: 409,
+  subtask_not_found: 404,
+  not_ready: 400,
+}
+
+/** Confirms the AI-generated report (see manager-report route) and marks the "Approve" checklist
+ * item complete — refuses if the report hasn't been generated/reviewed yet. Not hardcoded to a
+ * single role; see manager-report route's comment for why. */
+export async function POST(request: Request, { params }: { params: Promise<{ approvalId: string }> }) {
+  const caller = getCaller(request)
+  if (!caller) {
+    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+  }
+  if (!DEPARTMENT_ROLES.has(caller.role.name)) {
+    return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
+  }
+
+  const { approvalId } = await params
+  const ownership = getTaskOwnership(approvalId)
+  if (!ownership) {
+    return NextResponse.json({ error: 'Task not found' }, { status: 404 })
+  }
+  if (ownership.step.departmentName !== caller.role.name) {
+    return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
+  }
+
+  const result = approveManagerAssignment(approvalId, caller.user.id)
+  if (!result.ok) {
+    return NextResponse.json({ error: result.error }, { status: ERROR_STATUS[result.error] })
+  }
+
+  return NextResponse.json({ approvalStatus: result.approvalStatus, subtasks: result.subtasks })
+}

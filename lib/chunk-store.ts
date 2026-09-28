@@ -1,8 +1,9 @@
-import { promises as fs } from 'node:fs'
+import { DatabaseSync } from 'node:sqlite'
+import fs from 'node:fs'
 import path from 'node:path'
 
 const STORE_DIR = path.join(process.cwd(), 'storage')
-const CHUNKS_FILE = path.join(STORE_DIR, 'chunks.json')
+const DB_FILE = path.join(STORE_DIR, 'chunks.db')
 
 export type StoredChunk = {
   id: string
@@ -12,52 +13,72 @@ export type StoredChunk = {
   embedding: number[]
 }
 
-async function ensureStoreFile() {
-  await fs.mkdir(STORE_DIR, { recursive: true })
-  try {
-    await fs.access(CHUNKS_FILE)
-  } catch {
-    await fs.writeFile(CHUNKS_FILE, '[]', 'utf-8')
-  }
+let dbInstance: DatabaseSync | null = null
+
+function getDb(): DatabaseSync {
+  if (dbInstance) return dbInstance
+  fs.mkdirSync(STORE_DIR, { recursive: true })
+  const db = new DatabaseSync(DB_FILE)
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS chunks (
+      id TEXT PRIMARY KEY,
+      document_id TEXT NOT NULL,
+      chunk_index INTEGER NOT NULL,
+      text TEXT NOT NULL,
+      embedding BLOB NOT NULL
+    )
+  `)
+  db.exec('CREATE INDEX IF NOT EXISTS idx_chunks_document_id ON chunks(document_id)')
+  dbInstance = db
+  return db
 }
 
-async function readAll(): Promise<StoredChunk[]> {
-  await ensureStoreFile()
-  try {
-    const raw = await fs.readFile(CHUNKS_FILE, 'utf-8')
-    return raw.trim() ? JSON.parse(raw) : []
-  } catch {
-    return []
-  }
+function embeddingToBlob(embedding: number[]): Uint8Array {
+  const floats = new Float32Array(embedding)
+  return new Uint8Array(floats.buffer, floats.byteOffset, floats.byteLength)
 }
 
-async function writeAll(chunks: StoredChunk[]) {
-  await ensureStoreFile()
-  await fs.writeFile(CHUNKS_FILE, JSON.stringify(chunks), 'utf-8')
+function blobToEmbedding(blob: Uint8Array): number[] {
+  const floats = new Float32Array(blob.buffer, blob.byteOffset, blob.byteLength / Float32Array.BYTES_PER_ELEMENT)
+  return Array.from(floats)
+}
+
+type ChunkRow = {
+  id: string
+  documentId: string
+  chunkIndex: number
+  text: string
+  embedding: Uint8Array
 }
 
 export async function getIndexedDocumentIds(): Promise<Set<string>> {
-  const all = await readAll()
-  return new Set(all.map((c) => c.documentId))
+  const rows = getDb().prepare('SELECT DISTINCT document_id AS documentId FROM chunks').all() as Array<{ documentId: string }>
+  return new Set(rows.map((row) => row.documentId))
 }
 
 export async function replaceChunksForDocument(
   documentId: string,
   chunks: Array<{ chunkIndex: number; text: string; embedding: number[] }>,
 ) {
-  const all = await readAll()
-  const filtered = all.filter((c) => c.documentId !== documentId)
-  const newChunks: StoredChunk[] = chunks.map((c) => ({
-    id: `${documentId}-${c.chunkIndex}`,
-    documentId,
-    ...c,
-  }))
-  await writeAll([...filtered, ...newChunks])
+  const db = getDb()
+  db.exec('BEGIN')
+  try {
+    db.prepare('DELETE FROM chunks WHERE document_id = ?').run(documentId)
+    const insert = db.prepare(
+      'INSERT INTO chunks (id, document_id, chunk_index, text, embedding) VALUES (?, ?, ?, ?, ?)',
+    )
+    for (const chunk of chunks) {
+      insert.run(`${documentId}-${chunk.chunkIndex}`, documentId, chunk.chunkIndex, chunk.text, embeddingToBlob(chunk.embedding))
+    }
+    db.exec('COMMIT')
+  } catch (error) {
+    db.exec('ROLLBACK')
+    throw error
+  }
 }
 
 export async function deleteChunksForDocument(documentId: string) {
-  const all = await readAll()
-  await writeAll(all.filter((c) => c.documentId !== documentId))
+  getDb().prepare('DELETE FROM chunks WHERE document_id = ?').run(documentId)
 }
 
 // Embeddings from the model are already unit-length, so a plain dot product equals cosine similarity.
@@ -68,9 +89,22 @@ function dotProduct(a: number[], b: number[]): number {
 }
 
 export async function searchSimilarChunks(queryEmbedding: number[], topK = 5) {
-  const all = await readAll()
-  return all
-    .map((chunk) => ({ ...chunk, score: dotProduct(queryEmbedding, chunk.embedding) }))
+  const rows = getDb()
+    .prepare('SELECT id, document_id AS documentId, chunk_index AS chunkIndex, text, embedding FROM chunks')
+    .all() as unknown as ChunkRow[]
+
+  return rows
+    .map((row) => {
+      const embedding = blobToEmbedding(row.embedding)
+      return {
+        id: row.id,
+        documentId: row.documentId,
+        chunkIndex: row.chunkIndex,
+        text: row.text,
+        embedding,
+        score: dotProduct(queryEmbedding, embedding),
+      } satisfies StoredChunk & { score: number }
+    })
     .sort((a, b) => b.score - a.score)
     .slice(0, topK)
 }

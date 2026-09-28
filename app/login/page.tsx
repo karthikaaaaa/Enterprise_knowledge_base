@@ -4,7 +4,7 @@ import { useState } from 'react'
 import { ArrowRight, BookOpen, Check, Eye, EyeOff, LockKeyhole, Mail, ShieldCheck } from 'lucide-react'
 import { DEMO_USERS, type Role, useAuth } from '@/components/auth/auth-provider'
 
-const roleLabels: Record<Role, string> = { admin: 'Admin', hr: 'HR Manager', manager: 'IT / Engineering', finance: 'Finance', legal: 'Legal', employee: 'Employee' }
+const roleLabels: Record<Role, string> = { admin: 'Admin', hr: 'HR Manager', manager: 'IT / Engineering', it: 'IT Head', finance: 'Finance', legal: 'Legal', employee: 'Employee' }
 
 export default function LoginPage() {
   const { login } = useAuth()
