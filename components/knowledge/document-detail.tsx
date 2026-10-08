@@ -1,6 +1,7 @@
 'use client'
 
 import { useState } from 'react'
+import useSWR from 'swr'
 import Link from 'next/link'
 import { useRouter } from 'next/navigation'
 import {
@@ -19,7 +20,8 @@ import {
 import type { Document } from '@/lib/documents'
 import { DocIcon } from '@/components/knowledge/doc-icon'
 import { useAuth } from '@/components/auth/auth-provider'
-import { canViewDocument } from '@/lib/document-access'
+import { canViewDocument, type KbAccess } from '@/lib/document-access'
+import { authedFetcher } from '@/lib/api-client'
 
 function DocumentPreview({ doc }: { doc: Document & { pathname?: string; mimeType?: string; assetPath?: string } }) {
   const fileUrl = doc.assetPath ?? (doc.pathname ? `/api/documents/file?pathname=${encodeURIComponent(doc.pathname)}` : undefined)
@@ -97,6 +99,10 @@ function InfoRow({
 export function DocumentDetail({ doc }: { doc: Document & { pathname?: string; mimeType?: string; assetPath?: string; access?: string } }) {
   const router = useRouter()
   const { user } = useAuth()
+  const { data: kbAccess, isLoading: kbAccessLoading } = useSWR<KbAccess>(
+    user ? ['/api/knowledge-base/access', user.email] : null,
+    ([url]: [string, string]) => authedFetcher(user?.email)(url),
+  )
   const [confirmOpen, setConfirmOpen] = useState(false)
   const [deleting, setDeleting] = useState(false)
   const [deleteError, setDeleteError] = useState('')
@@ -145,7 +151,11 @@ export function DocumentDetail({ doc }: { doc: Document & { pathname?: string; m
     }
   }
 
-  if (!canViewDocument(user, doc)) {
+  // Wait for the grant check before deciding — otherwise an onboarding Employee would briefly see
+  // a document their grant doesn't cover.
+  if (kbAccessLoading) return null
+
+  if (!canViewDocument(user, doc, kbAccess)) {
     return <div className="rounded-3xl border border-border bg-card p-10 text-center shadow-soft"><h1 className="text-lg font-semibold text-foreground">Document access restricted</h1><p className="mt-2 text-sm text-muted-foreground">You can only access HR documents and files owned by your department.</p><Link href="/knowledge-base" className="mt-5 inline-flex rounded-xl bg-primary px-4 py-2.5 text-sm font-semibold text-primary-foreground">Back to Knowledge Base</Link></div>
   }
 

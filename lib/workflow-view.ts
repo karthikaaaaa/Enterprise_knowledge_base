@@ -7,8 +7,12 @@ import {
   getUserById,
   getDepartmentById,
   getRoleById,
+  getRoleByName,
+  listUsersByRole,
   type Workflow,
   type Approval,
+  type User,
+  type WorkflowStep,
 } from '@/lib/workflow-store'
 
 export type WorkflowEmployee = {
@@ -34,6 +38,9 @@ export type WorkflowSummary = {
   pendingVerificationCount: number
 }
 
+/** "In charge" chip shown on every step card — a real name/role, never a bare department string. */
+export type StepPerson = { name: string; role: string; initials: string }
+
 export type WorkflowStepDetail = {
   id: string
   order: number
@@ -44,6 +51,15 @@ export type WorkflowStepDetail = {
   approval: { status: string; comment: string | null; verifiedAt: string | null } | null
   /** True until every earlier step in the ordered list has been verified — steps run strictly top to bottom. */
   locked: boolean
+  /** Who owns this step right now — the real approver once notified/submitted, otherwise a
+   * resolved default (the employee, "AI System", or the owning department's head). Always present. */
+  inCharge: StepPerson
+  /** When this step was assigned/notified (the approval row's created_at) — null until then. */
+  assignedAt: string | null
+  completedBy: StepPerson | null
+  completedAt: string | null
+  verifiedBy: StepPerson | null
+  verifiedAt: string | null
 }
 
 export type WorkflowDetail = {
@@ -71,6 +87,77 @@ function describeEmployee(employeeId: string): WorkflowEmployee | null {
     department: department?.name ?? null,
     dateOfJoining: employee.dateOfJoining,
   }
+}
+
+/** Friendlier label than the bare Role.name for the people-facing "in charge" chip — HR and
+ * Manager already read fine standalone, but a lone "IT"/"Finance"/"Legal" reads as a department,
+ * not a person's role, next to a name. */
+const ROLE_DISPLAY_LABEL: Record<string, string> = {
+  HR: 'HR',
+  IT: 'IT Head',
+  Finance: 'Finance Head',
+  Legal: 'Legal Head',
+  Manager: 'Manager',
+  Administrator: 'Administrator',
+  Employee: 'Employee',
+}
+
+function initialsOf(name: string): string {
+  const parts = name.split(' ').filter(Boolean)
+  return parts.map((p) => p[0]!.toUpperCase()).slice(0, 2).join('') || '?'
+}
+
+function personFromUser(user: User): StepPerson {
+  const role = getRoleById(user.roleId)
+  return { name: user.name, role: role ? (ROLE_DISPLAY_LABEL[role.name] ?? role.name) : 'Staff', initials: initialsOf(user.name) }
+}
+
+function personFromUserId(userId: string | null): StepPerson | null {
+  if (!userId) return null
+  const user = getUserById(userId)
+  return user ? personFromUser(user) : null
+}
+
+/** The department's one head user — same "first user with this role" resolution
+ * resolveDepartmentApprover in lib/workflow-actions.ts uses, duplicated here rather than imported
+ * to avoid a circular import (workflow-actions.ts already imports from this module). */
+function departmentHeadUser(departmentName: string): User | null {
+  const role = getRoleByName(departmentName)
+  if (!role) return null
+  return listUsersByRole(role.id)[0] ?? null
+}
+
+/**
+ * Resolves who's "in charge" of a step:
+ *   1. If it's already been notified/submitted (an approval row with an approver_id exists), that's them.
+ *   2. employee_details / upload_documents: the employee themself.
+ *   3. ai_document_verification: the synthetic "AI System" — there's no real user behind this step.
+ *   4. Everything else (hr_approval, knowledge_base_access, completed, manager_approval,
+ *      it_account_creation, asset_allocation, it_verification, finance_verification,
+ *      legal_verification, and any ad-hoc step) — the head of the step's owning department,
+ *      which is exactly who Notify would assign it to (see resolveDepartmentApprover).
+ */
+function resolveInCharge(step: WorkflowStep, workflow: Workflow, approval: Approval | null): StepPerson {
+  if (approval?.approverId) {
+    const person = personFromUserId(approval.approverId)
+    if (person) return person
+  }
+
+  if (step.stepName === 'employee_details' || step.stepName === 'upload_documents') {
+    const employee = getEmployeeById(workflow.employeeId)
+    const user = employee ? getUserById(employee.userId) : null
+    if (user) return personFromUser(user)
+    const name = employee ? `${employee.firstName} ${employee.lastName}` : 'Employee'
+    return { name, role: 'Employee', initials: initialsOf(name) }
+  }
+
+  if (step.stepName === 'ai_document_verification') {
+    return { name: 'AI System', role: 'Automated', initials: 'AI' }
+  }
+
+  const head = departmentHeadUser(step.departmentName)
+  if (head) return personFromUser(head)
+  return { name: 'Unassigned', role: step.departmentName, initials: '?' }
 }
 
 /** Approvals accumulate over time (re-notify, re-verify); the most recently created row per step wins. */
@@ -126,6 +213,8 @@ export function listWorkflowSummaries(filter?: { employeeId?: string; department
 
 /** The workflow's full ordered step list, each joined with its latest approval — the shape both GET /api/workflows/[id] and the write endpoints (notify, ad-hoc insert) return. */
 export function listWorkflowStepDetails(workflowId: string): WorkflowStepDetail[] {
+  const workflow = getWorkflow(workflowId)
+  if (!workflow) return []
   const { steps, latest } = computeProgress(workflowId)
   return steps.map((step, index) => {
     const approval = latest.get(step.id) ?? null
@@ -140,6 +229,12 @@ export function listWorkflowStepDetails(workflowId: string): WorkflowStepDetail[
       isAdhoc: step.isAdhoc,
       approval: approval ? { status: approval.status, comment: approval.comment, verifiedAt: approval.verifiedAt } : null,
       locked,
+      inCharge: resolveInCharge(step, workflow, approval),
+      assignedAt: approval?.createdAt ?? null,
+      completedBy: personFromUserId(approval?.completedBy ?? null),
+      completedAt: approval?.completedAt ?? null,
+      verifiedBy: personFromUserId(approval?.verifiedBy ?? null),
+      verifiedAt: approval?.verifiedAt ?? null,
     }
   })
 }

@@ -88,12 +88,15 @@ function dotProduct(a: number[], b: number[]): number {
   return sum
 }
 
-export async function searchSimilarChunks(queryEmbedding: number[], topK = 5) {
+/** `allowedDocumentIds`, when given, limits the search to those documents BEFORE ranking — so a
+ * caller restricted to a few categories still gets their own top-K, not a filtered-down global one. */
+export async function searchSimilarChunks(queryEmbedding: number[], topK = 5, allowedDocumentIds?: Set<string>) {
   const rows = getDb()
     .prepare('SELECT id, document_id AS documentId, chunk_index AS chunkIndex, text, embedding FROM chunks')
     .all() as unknown as ChunkRow[]
 
   return rows
+    .filter((row) => !allowedDocumentIds || allowedDocumentIds.has(row.documentId))
     .map((row) => {
       const embedding = blobToEmbedding(row.embedding)
       return {

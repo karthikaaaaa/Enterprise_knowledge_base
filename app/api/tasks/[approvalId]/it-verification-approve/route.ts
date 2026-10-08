@@ -36,7 +36,7 @@ export async function POST(request: Request, { params }: { params: Promise<{ app
     return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
   }
 
-  const result = approveItVerification(approvalId)
+  const result = approveItVerification(approvalId, caller.user.id)
   if (!result.ok) {
     return NextResponse.json({ error: result.error }, { status: ERROR_STATUS[result.error] })
   }

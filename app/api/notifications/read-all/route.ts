@@ -8,6 +8,6 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   }
 
-  markAllNotificationsRead(caller.role.id)
+  markAllNotificationsRead(caller.role.id, caller.user.id)
   return NextResponse.json({ ok: true })
 }

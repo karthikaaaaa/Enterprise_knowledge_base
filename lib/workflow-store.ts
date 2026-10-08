@@ -8,7 +8,9 @@ const DB_FILE = path.join(STORE_DIR, 'workflows.db')
 
 let dbInstance: DatabaseSync | null = null
 
-function getDb(): DatabaseSync {
+/** The single shared connection. Exported so feature modules with their own tables (see
+ * lib/offboarding/store.ts) use the same connection and transactions as everything here. */
+export function getDb(): DatabaseSync {
   if (dbInstance) return dbInstance
   fs.mkdirSync(STORE_DIR, { recursive: true })
   const db = new DatabaseSync(DB_FILE)
@@ -215,6 +217,174 @@ function getDb(): DatabaseSync {
       generated_at TEXT NOT NULL
     );
 
+    -- One shared table for every "AI summary + single department action" step (asset_allocation,
+    -- it_verification, finance_verification, legal_verification), keyed by step_key, instead of a
+    -- new table per step. The two per-step tables above are kept only so their old rows can be
+    -- migrated in here on startup (see below) — nothing writes to them anymore.
+    CREATE TABLE IF NOT EXISTS step_ai_summaries (
+      id TEXT PRIMARY KEY,
+      workflow_id TEXT NOT NULL REFERENCES workflows(id),
+      step_id TEXT NOT NULL REFERENCES workflow_steps(id),
+      approval_id TEXT NOT NULL REFERENCES approvals(id),
+      step_key TEXT NOT NULL,
+      summary_text TEXT NOT NULL,
+      generated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS employee_kb_grants (
+      id TEXT PRIMARY KEY,
+      workflow_id TEXT NOT NULL REFERENCES workflows(id),
+      employee_id TEXT NOT NULL REFERENCES employees(id),
+      categories TEXT NOT NULL,
+      granted_by TEXT NOT NULL REFERENCES users(id),
+      granted_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS workflow_audit_log (
+      id TEXT PRIMARY KEY,
+      workflow_id TEXT NOT NULL REFERENCES workflows(id),
+      step_key TEXT NOT NULL,
+      action TEXT NOT NULL CHECK (action IN ('revert')),
+      performed_by TEXT NOT NULL REFERENCES users(id),
+      performed_at TEXT NOT NULL,
+      cascaded_step_keys TEXT NOT NULL
+    );
+
+    -- Every structured AI review run (see lib/ai-verification-log.ts), kept as an audit history —
+    -- re-running inserts a new row, nothing is overwritten. approval_id intentionally has NO
+    -- foreign key: revert deletes approvals, and these rows should survive that as history
+    -- (readers scope to the current approval) without revert needing to know this table exists.
+    CREATE TABLE IF NOT EXISTS ai_verification_runs (
+      id TEXT PRIMARY KEY,
+      workflow_id TEXT NOT NULL REFERENCES workflows(id),
+      step_key TEXT NOT NULL,
+      approval_id TEXT NOT NULL,
+      result_json TEXT NOT NULL,
+      overall_status TEXT NOT NULL,
+      model TEXT NOT NULL,
+      generated_at TEXT NOT NULL,
+      generated_by TEXT,
+      review_action TEXT CHECK (review_action IN ('verified', 'sent_back')),
+      review_comment TEXT,
+      reviewed_by TEXT,
+      reviewed_at TEXT
+    );
+
+    -- HR asking the employee for data the flow has nowhere else to collect (bank/tax details),
+    -- raised after Finance sends a review back. See lib/employee-info-requests.ts.
+    CREATE TABLE IF NOT EXISTS employee_info_requests (
+      id TEXT PRIMARY KEY,
+      workflow_id TEXT NOT NULL REFERENCES workflows(id),
+      step_key TEXT NOT NULL,
+      source_run_id TEXT,
+      requested_items TEXT NOT NULL,
+      message TEXT,
+      status TEXT NOT NULL CHECK (status IN ('open', 'fulfilled')),
+      requested_by TEXT NOT NULL REFERENCES users(id),
+      requested_at TEXT NOT NULL,
+      fulfilled_by TEXT REFERENCES users(id),
+      fulfilled_at TEXT,
+      response_id TEXT
+    );
+
+    -- What the employee sent back. Kept in its own table, not employee_documents, so bank/tax
+    -- numbers never flow into the AI document cross-check, the Legal pre-check prompt, or the HR
+    -- profile Knowledge Base entry — only the finance pre-check reads it. Columns are nullable
+    -- because one request may cover only some items; readers take the newest non-null per field.
+    CREATE TABLE IF NOT EXISTS employee_finance_details (
+      id TEXT PRIMARY KEY,
+      workflow_id TEXT NOT NULL REFERENCES workflows(id),
+      employee_id TEXT NOT NULL REFERENCES employees(id),
+      request_id TEXT REFERENCES employee_info_requests(id),
+      account_holder TEXT,
+      bank_account_number TEXT,
+      bank_routing_code TEXT,
+      tax_id TEXT,
+      file_name TEXT,
+      file_mime_type TEXT,
+      file_data TEXT,
+      submitted_by TEXT NOT NULL REFERENCES users(id),
+      submitted_at TEXT NOT NULL
+    );
+
+    -- Payroll entries created from finance_verification (see lib/payroll.ts): drafted from verified
+    -- records, confirmed by Finance, who supplies the compensation (no record in this app holds
+    -- salary). Bank/tax are referenced by employee_finance_details id, never copied here. One per
+    -- workflow.
+    CREATE TABLE IF NOT EXISTS payroll_records (
+      id TEXT PRIMARY KEY,
+      workflow_id TEXT NOT NULL UNIQUE REFERENCES workflows(id),
+      employee_id TEXT NOT NULL REFERENCES employees(id),
+      legal_name TEXT NOT NULL,
+      role_title TEXT NOT NULL,
+      department TEXT NOT NULL,
+      start_date TEXT NOT NULL,
+      pay_frequency TEXT NOT NULL CHECK (pay_frequency IN ('monthly', 'semi_monthly', 'biweekly', 'weekly')),
+      annual_salary REAL NOT NULL,
+      currency TEXT NOT NULL,
+      bank_details_ref TEXT NOT NULL,
+      tax_details_ref TEXT NOT NULL,
+      source_run_id TEXT,
+      created_by TEXT NOT NULL REFERENCES users(id),
+      created_at TEXT NOT NULL
+    );
+
+    -- Expense accounts created from finance_verification (lib/finance-records.ts) — drafted entirely
+    -- from records, confirmed by Finance. Reimbursement account is a reference, never a copy.
+    CREATE TABLE IF NOT EXISTS expense_accounts (
+      id TEXT PRIMARY KEY,
+      workflow_id TEXT NOT NULL UNIQUE REFERENCES workflows(id),
+      employee_id TEXT NOT NULL REFERENCES employees(id),
+      holder_name TEXT NOT NULL,
+      contact_email TEXT NOT NULL,
+      cost_center TEXT NOT NULL,
+      approver_name TEXT,
+      reimbursement_bank_ref TEXT NOT NULL,
+      source_run_id TEXT,
+      created_by TEXT NOT NULL REFERENCES users(id),
+      created_at TEXT NOT NULL
+    );
+
+    -- The Finance sign-off pack: a snapshot of the record ids Finance is signing off on, created
+    -- once every finance prerequisite is in place (lib/finance-records.ts).
+    CREATE TABLE IF NOT EXISTS finance_signoff_records (
+      id TEXT PRIMARY KEY,
+      workflow_id TEXT NOT NULL UNIQUE REFERENCES workflows(id),
+      snapshot_json TEXT NOT NULL,
+      source_run_id TEXT,
+      created_by TEXT NOT NULL REFERENCES users(id),
+      created_at TEXT NOT NULL
+    );
+
+    -- Agreements Legal issues from legal_verification (lib/legal-records.ts): rendered from a fixed
+    -- template with verified fields (the full text and template version are stored as issued), then
+    -- signed by the employee typing their legal name. One per workflow.
+    CREATE TABLE IF NOT EXISTS legal_agreements (
+      id TEXT PRIMARY KEY,
+      workflow_id TEXT NOT NULL UNIQUE REFERENCES workflows(id),
+      employee_id TEXT NOT NULL REFERENCES employees(id),
+      agreement_type TEXT NOT NULL,
+      title TEXT NOT NULL,
+      version TEXT NOT NULL,
+      body TEXT NOT NULL,
+      issued_by TEXT NOT NULL REFERENCES users(id),
+      issued_at TEXT NOT NULL,
+      signed_name TEXT,
+      signed_by TEXT REFERENCES users(id),
+      signed_at TEXT,
+      source_run_id TEXT
+    );
+
+    -- The Legal compliance sign-off pack: snapshot of the record ids Legal is signing off on.
+    CREATE TABLE IF NOT EXISTS legal_signoff_records (
+      id TEXT PRIMARY KEY,
+      workflow_id TEXT NOT NULL UNIQUE REFERENCES workflows(id),
+      snapshot_json TEXT NOT NULL,
+      source_run_id TEXT,
+      created_by TEXT NOT NULL REFERENCES users(id),
+      created_at TEXT NOT NULL
+    );
+
     CREATE INDEX IF NOT EXISTS idx_employees_user_id ON employees(user_id);
     CREATE INDEX IF NOT EXISTS idx_employees_manager_id ON employees(manager_id);
     CREATE INDEX IF NOT EXISTS idx_assets_assigned_employee_id ON assets(assigned_employee_id);
@@ -235,6 +405,55 @@ function getDb(): DatabaseSync {
     CREATE INDEX IF NOT EXISTS idx_it_account_reports_workflow_id ON it_account_reports(workflow_id);
     CREATE INDEX IF NOT EXISTS idx_asset_allocation_summaries_workflow_id ON asset_allocation_summaries(workflow_id);
     CREATE INDEX IF NOT EXISTS idx_it_verification_summaries_workflow_id ON it_verification_summaries(workflow_id);
+    CREATE INDEX IF NOT EXISTS idx_step_ai_summaries_workflow_id ON step_ai_summaries(workflow_id);
+    CREATE INDEX IF NOT EXISTS idx_employee_kb_grants_employee_id ON employee_kb_grants(employee_id);
+    CREATE INDEX IF NOT EXISTS idx_workflow_audit_log_workflow_id ON workflow_audit_log(workflow_id);
+    CREATE INDEX IF NOT EXISTS idx_ai_verification_runs_approval_id ON ai_verification_runs(approval_id);
+  `)
+
+  // Moves any rows still in the old per-step summary tables into step_ai_summaries (same ids, so
+  // INSERT OR IGNORE makes a re-run harmless), then empties the old tables so there's exactly one
+  // source of truth. One transaction: either both the copy and the clear happen, or neither does.
+  try {
+    db.exec('BEGIN')
+    db.exec(`
+      INSERT OR IGNORE INTO step_ai_summaries (id, workflow_id, step_id, approval_id, step_key, summary_text, generated_at)
+        SELECT id, workflow_id, step_id, approval_id, 'asset_allocation', summary_text, generated_at FROM asset_allocation_summaries;
+      INSERT OR IGNORE INTO step_ai_summaries (id, workflow_id, step_id, approval_id, step_key, summary_text, generated_at)
+        SELECT id, workflow_id, step_id, approval_id, 'it_verification', summary_text, generated_at FROM it_verification_summaries;
+      DELETE FROM asset_allocation_summaries;
+      DELETE FROM it_verification_summaries;
+    `)
+    db.exec('COMMIT')
+  } catch (error) {
+    db.exec('ROLLBACK')
+    console.error('[v0] step_ai_summaries migration failed:', error)
+  }
+
+  // approvals gained completed_by/completed_at after the table already existed on disk for anyone
+  // who ran an earlier version — same retrofit pattern as the hr_approval_profile_entries.summary
+  // column above. Harmless no-op (caught and ignored) once the columns are already present.
+  try {
+    db.exec('ALTER TABLE approvals ADD COLUMN completed_by TEXT REFERENCES users(id)')
+  } catch {
+    // Column already exists.
+  }
+  try {
+    db.exec('ALTER TABLE approvals ADD COLUMN completed_at TEXT')
+  } catch {
+    // Column already exists.
+  }
+
+  // Best-effort backfill for rows that reached 'completed'/'verified' before completed_by/
+  // completed_at existed — approver_id is the closest stand-in for "who completed it" available
+  // on old data (real completions from here on stamp it directly, see updateApprovalStatus /
+  // applyApprovalStatus), and verified_at/created_at the closest stand-in for "when". Guarded by
+  // completed_by IS NULL so this only ever touches rows the retrofit actually left behind, never
+  // a real completion recorded after this migration shipped.
+  db.exec(`
+    UPDATE approvals
+    SET completed_by = approver_id, completed_at = COALESCE(verified_at, created_at)
+    WHERE completed_by IS NULL AND approver_id IS NOT NULL AND status IN ('completed', 'verified')
   `)
 
   // hr_approval_profile_entries gained `summary` after the table already existed on disk for
@@ -336,6 +555,50 @@ function getDb(): DatabaseSync {
     }
   } catch (error) {
     console.error('[v0] it_verification content fixup failed:', error)
+  }
+
+  // finance_verification (Fatima) and legal_verification (Lucas) get the same treatment as
+  // asset_allocation/it_verification: no checklist, a single AI-generated summary produced on
+  // Notify (see lib/department-verification-report.ts) that the department head confirms with one
+  // "Verify" button — any leftover 4-item subtask_templates are deleted and never re-inserted.
+  try {
+    db.prepare(
+      "DELETE FROM subtask_templates WHERE step_id IN (SELECT id FROM workflow_steps WHERE step_name IN ('finance_verification', 'legal_verification'))",
+    ).run()
+  } catch (error) {
+    console.error('[v0] finance/legal_verification content fixup failed:', error)
+  }
+
+  // Offboarding reverses onboarding records softly (end-date / revoke, never delete) so Revert can
+  // restore them — these nullable columns are that soft state. Existing rows read as NULL, i.e.
+  // still active, so nothing about onboarding changes. Each ALTER is a no-op once applied.
+  for (const ddl of [
+    'ALTER TABLE employee_kb_grants ADD COLUMN revoked_at TEXT',
+    'ALTER TABLE employee_kb_grants ADD COLUMN revoked_by_workflow_id TEXT',
+    'ALTER TABLE payroll_records ADD COLUMN ended_at TEXT',
+    'ALTER TABLE payroll_records ADD COLUMN ended_by_workflow_id TEXT',
+    'ALTER TABLE expense_accounts ADD COLUMN ended_at TEXT',
+    'ALTER TABLE expense_accounts ADD COLUMN ended_by_workflow_id TEXT',
+    'ALTER TABLE workflow_audit_log ADD COLUMN reason TEXT',
+    // Per-user notifications (offboarding tells the exiting employee / their manager directly).
+    'ALTER TABLE notifications ADD COLUMN recipient_user_id TEXT',
+  ]) {
+    try {
+      db.exec(ddl)
+    } catch {
+      // Column already exists.
+    }
+  }
+
+  // The automated offboarding steps (IT access, asset recovery, finance settlement, legal
+  // clearance) no longer use the seeded checkbox checklists — same treatment as the onboarding
+  // AI-summary steps above.
+  try {
+    db.prepare(
+      "DELETE FROM subtask_templates WHERE step_id IN (SELECT id FROM workflow_steps WHERE step_name IN ('it_access_deactivation', 'asset_recovery', 'finance_settlement', 'legal_clearance'))",
+    ).run()
+  } catch (error) {
+    console.error('[v0] offboarding subtask fixup failed:', error)
   }
 
   dbInstance = db
@@ -490,6 +753,12 @@ export function getUserById(id: string): User | null {
 export function getUserByEmail(email: string): User | null {
   const row = getDb().prepare(`SELECT ${USER_COLUMNS} FROM users WHERE email = ?`).get(email) as UserRow | undefined
   return row ? mapUser(row) : null
+}
+
+/** Login switch — offboarding deactivates the exiting employee's account at Exit Completed (and
+ * Revert reactivates it). Inactive users are rejected by getCaller, so every API refuses them. */
+export function setUserActive(userId: string, active: boolean) {
+  getDb().prepare('UPDATE users SET is_active = ? WHERE id = ?').run(active ? 1 : 0, userId)
 }
 
 export function listUsers(): User[] {
@@ -930,6 +1199,8 @@ export type Approval = {
   status: ApprovalStatus
   comment: string | null
   createdAt: string
+  completedBy: string | null
+  completedAt: string | null
   verifiedBy: string | null
   verifiedAt: string | null
 }
@@ -942,6 +1213,8 @@ type ApprovalRow = {
   status: ApprovalStatus
   comment: string | null
   created_at: string
+  completed_by: string | null
+  completed_at: string | null
   verified_by: string | null
   verified_at: string | null
 }
@@ -955,12 +1228,15 @@ function mapApproval(row: ApprovalRow): Approval {
     status: row.status,
     comment: row.comment,
     createdAt: row.created_at,
+    completedBy: row.completed_by,
+    completedAt: row.completed_at,
     verifiedBy: row.verified_by,
     verifiedAt: row.verified_at,
   }
 }
 
-const APPROVAL_COLUMNS = 'id, workflow_id, step_id, approver_id, status, comment, created_at, verified_by, verified_at'
+const APPROVAL_COLUMNS =
+  'id, workflow_id, step_id, approver_id, status, comment, created_at, completed_by, completed_at, verified_by, verified_at'
 
 export function createApproval(input: {
   workflowId: string
@@ -968,6 +1244,8 @@ export function createApproval(input: {
   approverId?: string | null
   status: ApprovalStatus
   comment?: string | null
+  completedBy?: string | null
+  completedAt?: string | null
   verifiedBy?: string | null
   verifiedAt?: string | null
   createdAt?: string
@@ -980,11 +1258,13 @@ export function createApproval(input: {
     status: input.status,
     comment: input.comment ?? null,
     created_at: input.createdAt ?? nowIso(),
+    completed_by: input.completedBy ?? null,
+    completed_at: input.completedAt ?? null,
     verified_by: input.verifiedBy ?? null,
     verified_at: input.verifiedAt ?? null,
   }
   getDb()
-    .prepare(`INSERT INTO approvals (${APPROVAL_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+    .prepare(`INSERT INTO approvals (${APPROVAL_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
     .run(
       row.id,
       row.workflow_id,
@@ -993,6 +1273,8 @@ export function createApproval(input: {
       row.status,
       row.comment,
       row.created_at,
+      row.completed_by,
+      row.completed_at,
       row.verified_by,
       row.verified_at,
     )
@@ -1011,14 +1293,52 @@ export function listApprovalsByWorkflow(workflowId: string): Approval[] {
   return rows.map(mapApproval)
 }
 
+/**
+ * `clearCompletion: true` hard-resets completed_by/completed_at to NULL instead of the usual
+ * COALESCE-preserve — for when a step genuinely un-completes (e.g. a department unchecks a
+ * subtask, dropping the approval back from 'completed' to 'in_progress'), where the normal
+ * COALESCE behavior would wrongly leave the stale completed_by/completed_at in place.
+ */
 export function updateApprovalStatus(
   id: string,
   status: ApprovalStatus,
-  extra?: { comment?: string | null; verifiedBy?: string | null; verifiedAt?: string | null },
+  extra?: {
+    comment?: string | null
+    completedBy?: string | null
+    completedAt?: string | null
+    verifiedBy?: string | null
+    verifiedAt?: string | null
+    clearCompletion?: boolean
+  },
 ) {
+  if (extra?.clearCompletion) {
+    getDb().prepare('UPDATE approvals SET status = ?, completed_by = NULL, completed_at = NULL WHERE id = ?').run(status, id)
+    return
+  }
   getDb()
-    .prepare('UPDATE approvals SET status = ?, comment = COALESCE(?, comment), verified_by = COALESCE(?, verified_by), verified_at = COALESCE(?, verified_at) WHERE id = ?')
-    .run(status, extra?.comment ?? null, extra?.verifiedBy ?? null, extra?.verifiedAt ?? null, id)
+    .prepare(
+      'UPDATE approvals SET status = ?, comment = COALESCE(?, comment), completed_by = COALESCE(?, completed_by), completed_at = COALESCE(?, completed_at), verified_by = COALESCE(?, verified_by), verified_at = COALESCE(?, verified_at) WHERE id = ?',
+    )
+    .run(
+      status,
+      extra?.comment ?? null,
+      extra?.completedBy ?? null,
+      extra?.completedAt ?? null,
+      extra?.verifiedBy ?? null,
+      extra?.verifiedAt ?? null,
+      id,
+    )
+}
+
+/** Resets an approval row back to "never started" in place (kept for ad-hoc steps on revert,
+ * which stay allocated rather than being deleted entirely — see lib/workflow-revert.ts) — status
+ * plus every derived field cleared, mirroring what deleting-and-recreating the row would look like. */
+export function resetApprovalFields(id: string, status: ApprovalStatus) {
+  getDb()
+    .prepare(
+      "UPDATE approvals SET status = ?, completed_by = NULL, completed_at = NULL, verified_by = NULL, verified_at = NULL, comment = NULL WHERE id = ?",
+    )
+    .run(status, id)
 }
 
 // ---------- Subtask templates ----------
@@ -1114,6 +1434,14 @@ export function updateSubtaskStatus(id: string, status: SubtaskStatus, completed
     .run(status, status === 'completed' ? nowIso() : null, status === 'completed' ? completedBy : null, id)
 }
 
+/** Reverting an ad-hoc step back to 'allocated' (see lib/workflow-revert.ts) resets its checklist
+ * the same way — every subtask back to pending, un-completing whatever the department had done. */
+export function resetSubtasksForApproval(approvalId: string) {
+  getDb()
+    .prepare("UPDATE subtasks SET status = 'pending', completed_at = NULL, completed_by = NULL WHERE approval_id = ?")
+    .run(approvalId)
+}
+
 // ---------- Notifications ----------
 
 export type Notification = {
@@ -1145,7 +1473,14 @@ function mapNotification(row: NotificationRow): Notification {
   }
 }
 
-export function createNotification(input: { roleId?: string | null; approvalId?: string | null; message: string }): Notification {
+export function createNotification(input: {
+  roleId?: string | null
+  approvalId?: string | null
+  message: string
+  /** Narrows a role notification to one user (e.g. the exiting employee, or one manager) — other
+   * logins sharing the role never see it. Omitted, every user with the role sees it, as before. */
+  recipientUserId?: string | null
+}): Notification {
   const row: NotificationRow = {
     id: genId('notif'),
     role_id: input.roleId ?? null,
@@ -1155,29 +1490,33 @@ export function createNotification(input: { roleId?: string | null; approvalId?:
     created_at: nowIso(),
   }
   getDb()
-    .prepare('INSERT INTO notifications (id, role_id, approval_id, message, is_read, created_at) VALUES (?, ?, ?, ?, ?, ?)')
-    .run(row.id, row.role_id, row.approval_id, row.message, row.is_read, row.created_at)
+    .prepare('INSERT INTO notifications (id, role_id, approval_id, message, is_read, created_at, recipient_user_id) VALUES (?, ?, ?, ?, ?, ?, ?)')
+    .run(row.id, row.role_id, row.approval_id, row.message, row.is_read, row.created_at, input.recipientUserId ?? null)
   return mapNotification(row)
 }
 
-export function listNotificationsByRole(roleId: string): Notification[] {
+/** Role-wide notifications plus any addressed to `userId` specifically. Without a userId, only the
+ * role-wide ones. */
+const VISIBLE_TO = 'role_id = ? AND (recipient_user_id IS NULL OR recipient_user_id = ?)'
+
+export function listNotificationsByRole(roleId: string, userId: string | null = null): Notification[] {
   const rows = getDb()
-    .prepare('SELECT id, role_id, approval_id, message, is_read, created_at FROM notifications WHERE role_id = ? ORDER BY created_at DESC')
-    .all(roleId) as NotificationRow[]
+    .prepare(`SELECT id, role_id, approval_id, message, is_read, created_at FROM notifications WHERE ${VISIBLE_TO} ORDER BY created_at DESC`)
+    .all(roleId, userId) as NotificationRow[]
   return rows.map(mapNotification)
 }
 
-export function getNotificationById(id: string): Notification | null {
+export function getNotificationById(id: string): (Notification & { recipientUserId: string | null }) | null {
   const row = getDb()
-    .prepare('SELECT id, role_id, approval_id, message, is_read, created_at FROM notifications WHERE id = ?')
-    .get(id) as NotificationRow | undefined
-  return row ? mapNotification(row) : null
+    .prepare('SELECT id, role_id, approval_id, message, is_read, created_at, recipient_user_id FROM notifications WHERE id = ?')
+    .get(id) as (NotificationRow & { recipient_user_id: string | null }) | undefined
+  return row ? { ...mapNotification(row), recipientUserId: row.recipient_user_id } : null
 }
 
-export function countUnreadNotifications(roleId: string): number {
+export function countUnreadNotifications(roleId: string, userId: string | null = null): number {
   const row = getDb()
-    .prepare('SELECT COUNT(*) AS n FROM notifications WHERE role_id = ? AND is_read = 0')
-    .get(roleId) as { n: number }
+    .prepare(`SELECT COUNT(*) AS n FROM notifications WHERE ${VISIBLE_TO} AND is_read = 0`)
+    .get(roleId, userId) as { n: number }
   return row.n
 }
 
@@ -1185,8 +1524,15 @@ export function markNotificationRead(id: string) {
   getDb().prepare('UPDATE notifications SET is_read = 1 WHERE id = ?').run(id)
 }
 
-export function markAllNotificationsRead(roleId: string) {
-  getDb().prepare('UPDATE notifications SET is_read = 1 WHERE role_id = ? AND is_read = 0').run(roleId)
+export function markAllNotificationsRead(roleId: string, userId: string | null = null) {
+  getDb().prepare(`UPDATE notifications SET is_read = 1 WHERE ${VISIBLE_TO} AND is_read = 0`).run(roleId, userId)
+}
+
+/** Reverting a step (see lib/workflow-revert.ts) clears any bell notification tied to that
+ * approval, whether the approval row itself is being deleted or (ad-hoc steps) just reset in
+ * place — otherwise a stale "verified" notification with a dead deep-link would linger. */
+export function deleteNotificationsForApproval(approvalId: string) {
+  getDb().prepare('DELETE FROM notifications WHERE approval_id = ?').run(approvalId)
 }
 
 // ---------- Employee detail submissions ----------
@@ -1556,6 +1902,16 @@ export function getLatestHrApprovalProfileEntry(workflowId: string): HrApprovalP
   return row ? mapHrApprovalProfileEntry(row) : null
 }
 
+/** Every profile entry this workflow's hr_approval step has ever generated — unlike
+ * getLatestHrApprovalProfileEntry, used by revert (see lib/workflow-revert.ts) to find every KB
+ * document a re-generation left behind, since none of them are retracted when a fresh one is made. */
+export function listHrApprovalProfileEntriesForWorkflow(workflowId: string): HrApprovalProfileEntry[] {
+  const rows = getDb()
+    .prepare(`SELECT ${HR_APPROVAL_PROFILE_ENTRY_COLUMNS} FROM hr_approval_profile_entries WHERE workflow_id = ?`)
+    .all(workflowId) as HrApprovalProfileEntryRow[]
+  return rows.map(mapHrApprovalProfileEntry)
+}
+
 // ---------- Manager approval: AI-generated team/date/role report ----------
 
 export type ManagerApprovalReport = {
@@ -1724,144 +2080,856 @@ export function getLatestItAccountReport(workflowId: string): ItAccountReport | 
   return row ? mapItAccountReport(row) : null
 }
 
-// ---------- Asset allocation: AI-generated summary ----------
-// asset_allocation has no subtask checklist — a single AI-generated plain-language summary of the
-// standard asset kit (see lib/asset-allocation-report.ts), generated on Notify, that Diego reviews
-// and approves with one button (see task-actions.ts).
+// ---------- AI-summary steps: one shared table ----------
+// asset_allocation, it_verification, finance_verification and legal_verification have no subtask
+// checklist — a single AI-generated plain-language summary (generated on Notify, see
+// workflow-actions.ts) that the owning department head reviews and confirms with one button (see
+// task-actions.ts). All four live in step_ai_summaries, keyed by step_key.
 
-export type AssetAllocationSummary = {
+export type StepAiSummaryKey =
+  | 'asset_allocation'
+  | 'it_verification'
+  | 'finance_verification'
+  | 'legal_verification'
+  | 'hr_exit_approval'
+  | 'it_access_deactivation'
+  | 'finance_settlement'
+  | 'legal_clearance'
+
+export type StepAiSummary = {
   id: string
   workflowId: string
   stepId: string
   approvalId: string
+  stepKey: StepAiSummaryKey
   summaryText: string
   generatedAt: string
 }
 
-type AssetAllocationSummaryRow = {
+type StepAiSummaryRow = {
   id: string
   workflow_id: string
   step_id: string
   approval_id: string
+  step_key: StepAiSummaryKey
   summary_text: string
   generated_at: string
 }
 
-function mapAssetAllocationSummary(row: AssetAllocationSummaryRow): AssetAllocationSummary {
+function mapStepAiSummary(row: StepAiSummaryRow): StepAiSummary {
   return {
     id: row.id,
     workflowId: row.workflow_id,
     stepId: row.step_id,
     approvalId: row.approval_id,
+    stepKey: row.step_key,
     summaryText: row.summary_text,
     generatedAt: row.generated_at,
   }
 }
 
-const ASSET_ALLOCATION_SUMMARY_COLUMNS = 'id, workflow_id, step_id, approval_id, summary_text, generated_at'
+const STEP_AI_SUMMARY_COLUMNS = 'id, workflow_id, step_id, approval_id, step_key, summary_text, generated_at'
 
-export function createAssetAllocationSummary(input: {
+export function createStepAiSummary(input: {
   workflowId: string
   stepId: string
   approvalId: string
+  stepKey: StepAiSummaryKey
   summaryText: string
   generatedAt?: string
-}): AssetAllocationSummary {
-  const row: AssetAllocationSummaryRow = {
-    id: genId('assetsummary'),
+}): StepAiSummary {
+  const row: StepAiSummaryRow = {
+    id: genId('stepsummary'),
     workflow_id: input.workflowId,
     step_id: input.stepId,
     approval_id: input.approvalId,
+    step_key: input.stepKey,
     summary_text: input.summaryText,
     generated_at: input.generatedAt ?? nowIso(),
   }
   getDb()
-    .prepare(`INSERT INTO asset_allocation_summaries (${ASSET_ALLOCATION_SUMMARY_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?)`)
-    .run(row.id, row.workflow_id, row.step_id, row.approval_id, row.summary_text, row.generated_at)
-  return mapAssetAllocationSummary(row)
+    .prepare(`INSERT INTO step_ai_summaries (${STEP_AI_SUMMARY_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?)`)
+    .run(row.id, row.workflow_id, row.step_id, row.approval_id, row.step_key, row.summary_text, row.generated_at)
+  return mapStepAiSummary(row)
 }
 
-export function getLatestAssetAllocationSummary(workflowId: string): AssetAllocationSummary | null {
+export function getLatestStepAiSummary(workflowId: string, stepKey: StepAiSummaryKey): StepAiSummary | null {
   const row = getDb()
     .prepare(
-      `SELECT ${ASSET_ALLOCATION_SUMMARY_COLUMNS} FROM asset_allocation_summaries WHERE workflow_id = ? ORDER BY generated_at DESC LIMIT 1`,
+      `SELECT ${STEP_AI_SUMMARY_COLUMNS} FROM step_ai_summaries WHERE workflow_id = ? AND step_key = ? ORDER BY generated_at DESC LIMIT 1`,
     )
-    .get(workflowId) as AssetAllocationSummaryRow | undefined
-  return row ? mapAssetAllocationSummary(row) : null
+    .get(workflowId, stepKey) as StepAiSummaryRow | undefined
+  return row ? mapStepAiSummary(row) : null
 }
 
-// ---------- IT verification: AI-generated summary ----------
-// it_verification has no subtask checklist either — a single AI-generated confirmation summary
-// (see lib/it-verification-report.ts) that only exists once it_account_creation AND
-// asset_allocation are both verified, reviewed and approved by Diego with one button, same shape
-// as asset_allocation above.
+// ---------- AI verification runs ----------
+// The structured review log behind finance_verification (and, later, any step that adopts
+// lib/ai-verification-log.ts). `result` is the full AiVerificationLog JSON, stored verbatim.
 
-export type ItVerificationSummary = {
+export type AiVerificationReviewAction = 'verified' | 'sent_back'
+
+export type AiVerificationRun = {
   id: string
   workflowId: string
-  stepId: string
+  stepKey: string
   approvalId: string
-  summaryText: string
+  result: unknown
+  overallStatus: string
+  model: string
   generatedAt: string
+  generatedBy: string | null
+  reviewAction: AiVerificationReviewAction | null
+  reviewComment: string | null
+  reviewedBy: string | null
+  reviewedAt: string | null
 }
 
-type ItVerificationSummaryRow = {
+type AiVerificationRunRow = {
   id: string
   workflow_id: string
-  step_id: string
+  step_key: string
   approval_id: string
-  summary_text: string
+  result_json: string
+  overall_status: string
+  model: string
   generated_at: string
+  generated_by: string | null
+  review_action: AiVerificationReviewAction | null
+  review_comment: string | null
+  reviewed_by: string | null
+  reviewed_at: string | null
 }
 
-function mapItVerificationSummary(row: ItVerificationSummaryRow): ItVerificationSummary {
+function mapAiVerificationRun(row: AiVerificationRunRow): AiVerificationRun {
   return {
     id: row.id,
     workflowId: row.workflow_id,
-    stepId: row.step_id,
+    stepKey: row.step_key,
     approvalId: row.approval_id,
-    summaryText: row.summary_text,
+    result: JSON.parse(row.result_json),
+    overallStatus: row.overall_status,
+    model: row.model,
     generatedAt: row.generated_at,
+    generatedBy: row.generated_by,
+    reviewAction: row.review_action,
+    reviewComment: row.review_comment,
+    reviewedBy: row.reviewed_by,
+    reviewedAt: row.reviewed_at,
   }
 }
 
-const IT_VERIFICATION_SUMMARY_COLUMNS = 'id, workflow_id, step_id, approval_id, summary_text, generated_at'
-
-export function createItVerificationSummary(input: {
+/** `id` is the log's own runId, so the stored row and the JSON inside it always agree. */
+export function createAiVerificationRun(input: {
+  id: string
   workflowId: string
-  stepId: string
+  stepKey: string
   approvalId: string
-  summaryText: string
-  generatedAt?: string
-}): ItVerificationSummary {
-  const row: ItVerificationSummaryRow = {
-    id: genId('itverifysummary'),
+  result: { overallStatus: string; model: string; generatedAt: string }
+  generatedBy: string | null
+}): AiVerificationRun {
+  getDb()
+    .prepare(
+      'INSERT INTO ai_verification_runs (id, workflow_id, step_key, approval_id, result_json, overall_status, model, generated_at, generated_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+    )
+    .run(
+      input.id,
+      input.workflowId,
+      input.stepKey,
+      input.approvalId,
+      JSON.stringify(input.result),
+      input.result.overallStatus,
+      input.result.model,
+      input.result.generatedAt,
+      input.generatedBy,
+    )
+  return getAiVerificationRun(input.id)!
+}
+
+export function getAiVerificationRun(id: string): AiVerificationRun | null {
+  const row = getDb().prepare('SELECT * FROM ai_verification_runs WHERE id = ?').get(id) as AiVerificationRunRow | undefined
+  return row ? mapAiVerificationRun(row) : null
+}
+
+/** Newest first. Scoped to one approval, so runs from before a revert stay stored but never show. */
+export function listAiVerificationRuns(approvalId: string, stepKey: string): AiVerificationRun[] {
+  const rows = getDb()
+    .prepare('SELECT * FROM ai_verification_runs WHERE approval_id = ? AND step_key = ? ORDER BY generated_at DESC, rowid DESC')
+    .all(approvalId, stepKey) as AiVerificationRunRow[]
+  return rows.map(mapAiVerificationRun)
+}
+
+/** Every run of a step on this workflow, across approvals — including rounds that were reverted
+ * (runs are never deleted). Newest first. */
+export function listAiVerificationRunsForWorkflowStep(workflowId: string, stepKey: string): AiVerificationRun[] {
+  const rows = getDb()
+    .prepare('SELECT * FROM ai_verification_runs WHERE workflow_id = ? AND step_key = ? ORDER BY generated_at DESC, rowid DESC')
+    .all(workflowId, stepKey) as AiVerificationRunRow[]
+  return rows.map(mapAiVerificationRun)
+}
+
+export function recordAiVerificationRunReview(
+  id: string,
+  input: { action: AiVerificationReviewAction; comment: string | null; reviewedBy: string; reviewedAt?: string },
+) {
+  getDb()
+    .prepare('UPDATE ai_verification_runs SET review_action = ?, review_comment = ?, reviewed_by = ?, reviewed_at = ? WHERE id = ?')
+    .run(input.action, input.comment, input.reviewedBy, input.reviewedAt ?? nowIso(), id)
+}
+
+// ---------- Employee info requests ----------
+
+export type EmployeeInfoRequestStatus = 'open' | 'fulfilled'
+
+export type EmployeeInfoRequest = {
+  id: string
+  workflowId: string
+  stepKey: string
+  sourceRunId: string | null
+  requestedItems: string[]
+  message: string | null
+  status: EmployeeInfoRequestStatus
+  requestedBy: string
+  requestedAt: string
+  fulfilledBy: string | null
+  fulfilledAt: string | null
+  responseId: string | null
+}
+
+type EmployeeInfoRequestRow = {
+  id: string
+  workflow_id: string
+  step_key: string
+  source_run_id: string | null
+  requested_items: string
+  message: string | null
+  status: EmployeeInfoRequestStatus
+  requested_by: string
+  requested_at: string
+  fulfilled_by: string | null
+  fulfilled_at: string | null
+  response_id: string | null
+}
+
+function mapEmployeeInfoRequest(row: EmployeeInfoRequestRow): EmployeeInfoRequest {
+  return {
+    id: row.id,
+    workflowId: row.workflow_id,
+    stepKey: row.step_key,
+    sourceRunId: row.source_run_id,
+    requestedItems: JSON.parse(row.requested_items),
+    message: row.message,
+    status: row.status,
+    requestedBy: row.requested_by,
+    requestedAt: row.requested_at,
+    fulfilledBy: row.fulfilled_by,
+    fulfilledAt: row.fulfilled_at,
+    responseId: row.response_id,
+  }
+}
+
+export function createEmployeeInfoRequest(input: {
+  workflowId: string
+  stepKey: string
+  sourceRunId: string | null
+  requestedItems: string[]
+  message: string | null
+  requestedBy: string
+}): EmployeeInfoRequest {
+  const id = genId('inforeq')
+  getDb()
+    .prepare(
+      "INSERT INTO employee_info_requests (id, workflow_id, step_key, source_run_id, requested_items, message, status, requested_by, requested_at) VALUES (?, ?, ?, ?, ?, ?, 'open', ?, ?)",
+    )
+    .run(id, input.workflowId, input.stepKey, input.sourceRunId, JSON.stringify(input.requestedItems), input.message, input.requestedBy, nowIso())
+  return getEmployeeInfoRequest(id)!
+}
+
+export function getEmployeeInfoRequest(id: string): EmployeeInfoRequest | null {
+  const row = getDb().prepare('SELECT * FROM employee_info_requests WHERE id = ?').get(id) as EmployeeInfoRequestRow | undefined
+  return row ? mapEmployeeInfoRequest(row) : null
+}
+
+/** Newest first. */
+export function listEmployeeInfoRequests(workflowId: string, stepKey: string): EmployeeInfoRequest[] {
+  const rows = getDb()
+    .prepare('SELECT * FROM employee_info_requests WHERE workflow_id = ? AND step_key = ? ORDER BY requested_at DESC, rowid DESC')
+    .all(workflowId, stepKey) as EmployeeInfoRequestRow[]
+  return rows.map(mapEmployeeInfoRequest)
+}
+
+export function markEmployeeInfoRequestFulfilled(id: string, input: { fulfilledBy: string; responseId: string }) {
+  getDb()
+    .prepare("UPDATE employee_info_requests SET status = 'fulfilled', fulfilled_by = ?, fulfilled_at = ?, response_id = ? WHERE id = ?")
+    .run(input.fulfilledBy, nowIso(), input.responseId, id)
+}
+
+// ---------- Employee finance details ----------
+
+export type EmployeeFinanceDetails = {
+  id: string
+  workflowId: string
+  employeeId: string
+  requestId: string | null
+  accountHolder: string | null
+  bankAccountNumber: string | null
+  bankRoutingCode: string | null
+  taxId: string | null
+  fileName: string | null
+  fileMimeType: string | null
+  fileData: string | null
+  submittedBy: string
+  submittedAt: string
+}
+
+type EmployeeFinanceDetailsRow = {
+  id: string
+  workflow_id: string
+  employee_id: string
+  request_id: string | null
+  account_holder: string | null
+  bank_account_number: string | null
+  bank_routing_code: string | null
+  tax_id: string | null
+  file_name: string | null
+  file_mime_type: string | null
+  file_data: string | null
+  submitted_by: string
+  submitted_at: string
+}
+
+function mapEmployeeFinanceDetails(row: EmployeeFinanceDetailsRow): EmployeeFinanceDetails {
+  return {
+    id: row.id,
+    workflowId: row.workflow_id,
+    employeeId: row.employee_id,
+    requestId: row.request_id,
+    accountHolder: row.account_holder,
+    bankAccountNumber: row.bank_account_number,
+    bankRoutingCode: row.bank_routing_code,
+    taxId: row.tax_id,
+    fileName: row.file_name,
+    fileMimeType: row.file_mime_type,
+    fileData: row.file_data,
+    submittedBy: row.submitted_by,
+    submittedAt: row.submitted_at,
+  }
+}
+
+export function createEmployeeFinanceDetails(input: Omit<EmployeeFinanceDetails, 'id' | 'submittedAt'>): EmployeeFinanceDetails {
+  const id = genId('findetails')
+  getDb()
+    .prepare(
+      'INSERT INTO employee_finance_details (id, workflow_id, employee_id, request_id, account_holder, bank_account_number, bank_routing_code, tax_id, file_name, file_mime_type, file_data, submitted_by, submitted_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+    )
+    .run(
+      id,
+      input.workflowId,
+      input.employeeId,
+      input.requestId,
+      input.accountHolder,
+      input.bankAccountNumber,
+      input.bankRoutingCode,
+      input.taxId,
+      input.fileName,
+      input.fileMimeType,
+      input.fileData,
+      input.submittedBy,
+      nowIso(),
+    )
+  return listEmployeeFinanceDetails(input.workflowId).find((d) => d.id === id)!
+}
+
+/** Newest first. */
+export function listEmployeeFinanceDetails(workflowId: string): EmployeeFinanceDetails[] {
+  const rows = getDb()
+    .prepare('SELECT * FROM employee_finance_details WHERE workflow_id = ? ORDER BY submitted_at DESC, rowid DESC')
+    .all(workflowId) as EmployeeFinanceDetailsRow[]
+  return rows.map(mapEmployeeFinanceDetails)
+}
+
+// ---------- Payroll records ----------
+
+export type PayFrequency = 'monthly' | 'semi_monthly' | 'biweekly' | 'weekly'
+
+export type PayrollRecord = {
+  id: string
+  workflowId: string
+  employeeId: string
+  legalName: string
+  roleTitle: string
+  department: string
+  startDate: string
+  payFrequency: PayFrequency
+  annualSalary: number
+  currency: string
+  bankDetailsRef: string
+  taxDetailsRef: string
+  sourceRunId: string | null
+  createdBy: string
+  createdAt: string
+}
+
+type PayrollRecordRow = {
+  id: string
+  workflow_id: string
+  employee_id: string
+  legal_name: string
+  role_title: string
+  department: string
+  start_date: string
+  pay_frequency: PayFrequency
+  annual_salary: number
+  currency: string
+  bank_details_ref: string
+  tax_details_ref: string
+  source_run_id: string | null
+  created_by: string
+  created_at: string
+}
+
+function mapPayrollRecord(row: PayrollRecordRow): PayrollRecord {
+  return {
+    id: row.id,
+    workflowId: row.workflow_id,
+    employeeId: row.employee_id,
+    legalName: row.legal_name,
+    roleTitle: row.role_title,
+    department: row.department,
+    startDate: row.start_date,
+    payFrequency: row.pay_frequency,
+    annualSalary: row.annual_salary,
+    currency: row.currency,
+    bankDetailsRef: row.bank_details_ref,
+    taxDetailsRef: row.tax_details_ref,
+    sourceRunId: row.source_run_id,
+    createdBy: row.created_by,
+    createdAt: row.created_at,
+  }
+}
+
+export function createPayrollRecord(input: Omit<PayrollRecord, 'id' | 'createdAt'>): PayrollRecord {
+  const id = genId('payroll')
+  getDb()
+    .prepare(
+      'INSERT INTO payroll_records (id, workflow_id, employee_id, legal_name, role_title, department, start_date, pay_frequency, annual_salary, currency, bank_details_ref, tax_details_ref, source_run_id, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+    )
+    .run(
+      id,
+      input.workflowId,
+      input.employeeId,
+      input.legalName,
+      input.roleTitle,
+      input.department,
+      input.startDate,
+      input.payFrequency,
+      input.annualSalary,
+      input.currency,
+      input.bankDetailsRef,
+      input.taxDetailsRef,
+      input.sourceRunId,
+      input.createdBy,
+      nowIso(),
+    )
+  return getPayrollRecordByWorkflow(input.workflowId)!
+}
+
+export function getPayrollRecordByWorkflow(workflowId: string): PayrollRecord | null {
+  const row = getDb().prepare('SELECT * FROM payroll_records WHERE workflow_id = ?').get(workflowId) as PayrollRecordRow | undefined
+  return row ? mapPayrollRecord(row) : null
+}
+
+// ---------- Expense accounts ----------
+
+export type ExpenseAccount = {
+  id: string
+  workflowId: string
+  employeeId: string
+  holderName: string
+  contactEmail: string
+  costCenter: string
+  approverName: string | null
+  reimbursementBankRef: string
+  sourceRunId: string | null
+  createdBy: string
+  createdAt: string
+}
+
+type ExpenseAccountRow = {
+  id: string
+  workflow_id: string
+  employee_id: string
+  holder_name: string
+  contact_email: string
+  cost_center: string
+  approver_name: string | null
+  reimbursement_bank_ref: string
+  source_run_id: string | null
+  created_by: string
+  created_at: string
+}
+
+function mapExpenseAccount(row: ExpenseAccountRow): ExpenseAccount {
+  return {
+    id: row.id,
+    workflowId: row.workflow_id,
+    employeeId: row.employee_id,
+    holderName: row.holder_name,
+    contactEmail: row.contact_email,
+    costCenter: row.cost_center,
+    approverName: row.approver_name,
+    reimbursementBankRef: row.reimbursement_bank_ref,
+    sourceRunId: row.source_run_id,
+    createdBy: row.created_by,
+    createdAt: row.created_at,
+  }
+}
+
+export function createExpenseAccount(input: Omit<ExpenseAccount, 'id' | 'createdAt'>): ExpenseAccount {
+  getDb()
+    .prepare(
+      'INSERT INTO expense_accounts (id, workflow_id, employee_id, holder_name, contact_email, cost_center, approver_name, reimbursement_bank_ref, source_run_id, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+    )
+    .run(
+      genId('expense'),
+      input.workflowId,
+      input.employeeId,
+      input.holderName,
+      input.contactEmail,
+      input.costCenter,
+      input.approverName,
+      input.reimbursementBankRef,
+      input.sourceRunId,
+      input.createdBy,
+      nowIso(),
+    )
+  return getExpenseAccountByWorkflow(input.workflowId)!
+}
+
+export function getExpenseAccountByWorkflow(workflowId: string): ExpenseAccount | null {
+  const row = getDb().prepare('SELECT * FROM expense_accounts WHERE workflow_id = ?').get(workflowId) as ExpenseAccountRow | undefined
+  return row ? mapExpenseAccount(row) : null
+}
+
+// ---------- Finance sign-off records ----------
+
+export type FinanceSignoffRecord = {
+  id: string
+  workflowId: string
+  snapshot: Record<string, string | null>
+  sourceRunId: string | null
+  createdBy: string
+  createdAt: string
+}
+
+type FinanceSignoffRecordRow = {
+  id: string
+  workflow_id: string
+  snapshot_json: string
+  source_run_id: string | null
+  created_by: string
+  created_at: string
+}
+
+export function createFinanceSignoffRecord(input: Omit<FinanceSignoffRecord, 'id' | 'createdAt'>): FinanceSignoffRecord {
+  getDb()
+    .prepare('INSERT INTO finance_signoff_records (id, workflow_id, snapshot_json, source_run_id, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?)')
+    .run(genId('signoff'), input.workflowId, JSON.stringify(input.snapshot), input.sourceRunId, input.createdBy, nowIso())
+  return getFinanceSignoffRecordByWorkflow(input.workflowId)!
+}
+
+export function getFinanceSignoffRecordByWorkflow(workflowId: string): FinanceSignoffRecord | null {
+  const row = getDb().prepare('SELECT * FROM finance_signoff_records WHERE workflow_id = ?').get(workflowId) as
+    | FinanceSignoffRecordRow
+    | undefined
+  return row
+    ? {
+        id: row.id,
+        workflowId: row.workflow_id,
+        snapshot: JSON.parse(row.snapshot_json),
+        sourceRunId: row.source_run_id,
+        createdBy: row.created_by,
+        createdAt: row.created_at,
+      }
+    : null
+}
+
+/** Revert of finance_verification: everything the step produced or collected goes, child-first,
+ * so the step can be done over from scratch — sign-off pack, expense account, payroll entry, the
+ * employee's submitted bank/tax details, and the info requests that asked for them. The AI runs are
+ * kept as audit history; they're scoped to the deleted approval, so they never show again. */
+export function deleteFinanceVerificationArtifactsForWorkflow(workflowId: string) {
+  const db = getDb()
+  db.prepare('DELETE FROM finance_signoff_records WHERE workflow_id = ?').run(workflowId)
+  db.prepare('DELETE FROM expense_accounts WHERE workflow_id = ?').run(workflowId)
+  db.prepare('DELETE FROM payroll_records WHERE workflow_id = ?').run(workflowId)
+  db.prepare('DELETE FROM employee_finance_details WHERE workflow_id = ?').run(workflowId)
+  db.prepare("DELETE FROM employee_info_requests WHERE workflow_id = ? AND step_key = 'finance_verification'").run(workflowId)
+}
+
+// ---------- Legal agreements ----------
+
+export type LegalAgreement = {
+  id: string
+  workflowId: string
+  employeeId: string
+  agreementType: string
+  title: string
+  version: string
+  body: string
+  issuedBy: string
+  issuedAt: string
+  signedName: string | null
+  signedBy: string | null
+  signedAt: string | null
+  sourceRunId: string | null
+}
+
+type LegalAgreementRow = {
+  id: string
+  workflow_id: string
+  employee_id: string
+  agreement_type: string
+  title: string
+  version: string
+  body: string
+  issued_by: string
+  issued_at: string
+  signed_name: string | null
+  signed_by: string | null
+  signed_at: string | null
+  source_run_id: string | null
+}
+
+function mapLegalAgreement(row: LegalAgreementRow): LegalAgreement {
+  return {
+    id: row.id,
+    workflowId: row.workflow_id,
+    employeeId: row.employee_id,
+    agreementType: row.agreement_type,
+    title: row.title,
+    version: row.version,
+    body: row.body,
+    issuedBy: row.issued_by,
+    issuedAt: row.issued_at,
+    signedName: row.signed_name,
+    signedBy: row.signed_by,
+    signedAt: row.signed_at,
+    sourceRunId: row.source_run_id,
+  }
+}
+
+export function createLegalAgreement(
+  input: Pick<LegalAgreement, 'workflowId' | 'employeeId' | 'agreementType' | 'title' | 'version' | 'body' | 'issuedBy' | 'sourceRunId'>,
+): LegalAgreement {
+  getDb()
+    .prepare(
+      'INSERT INTO legal_agreements (id, workflow_id, employee_id, agreement_type, title, version, body, issued_by, issued_at, source_run_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+    )
+    .run(
+      genId('agreement'),
+      input.workflowId,
+      input.employeeId,
+      input.agreementType,
+      input.title,
+      input.version,
+      input.body,
+      input.issuedBy,
+      nowIso(),
+      input.sourceRunId,
+    )
+  return getLegalAgreementByWorkflow(input.workflowId)!
+}
+
+export function getLegalAgreementByWorkflow(workflowId: string): LegalAgreement | null {
+  const row = getDb().prepare('SELECT * FROM legal_agreements WHERE workflow_id = ?').get(workflowId) as LegalAgreementRow | undefined
+  return row ? mapLegalAgreement(row) : null
+}
+
+/** Only ever sets a signature once — the WHERE clause refuses to overwrite an existing one. */
+export function signLegalAgreement(id: string, input: { signedName: string; signedBy: string }): boolean {
+  const result = getDb()
+    .prepare('UPDATE legal_agreements SET signed_name = ?, signed_by = ?, signed_at = ? WHERE id = ? AND signed_at IS NULL')
+    .run(input.signedName, input.signedBy, nowIso(), id)
+  return Number(result.changes) === 1
+}
+
+// ---------- Legal sign-off records ----------
+
+export type LegalSignoffRecord = {
+  id: string
+  workflowId: string
+  snapshot: Record<string, string | null>
+  sourceRunId: string | null
+  createdBy: string
+  createdAt: string
+}
+
+export function createLegalSignoffRecord(input: Omit<LegalSignoffRecord, 'id' | 'createdAt'>): LegalSignoffRecord {
+  getDb()
+    .prepare('INSERT INTO legal_signoff_records (id, workflow_id, snapshot_json, source_run_id, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?)')
+    .run(genId('legalsignoff'), input.workflowId, JSON.stringify(input.snapshot), input.sourceRunId, input.createdBy, nowIso())
+  return getLegalSignoffRecordByWorkflow(input.workflowId)!
+}
+
+export function getLegalSignoffRecordByWorkflow(workflowId: string): LegalSignoffRecord | null {
+  const row = getDb().prepare('SELECT * FROM legal_signoff_records WHERE workflow_id = ?').get(workflowId) as
+    | { id: string; workflow_id: string; snapshot_json: string; source_run_id: string | null; created_by: string; created_at: string }
+    | undefined
+  return row
+    ? {
+        id: row.id,
+        workflowId: row.workflow_id,
+        snapshot: JSON.parse(row.snapshot_json),
+        sourceRunId: row.source_run_id,
+        createdBy: row.created_by,
+        createdAt: row.created_at,
+      }
+    : null
+}
+
+/** Revert of legal_verification: the compliance sign-off pack and the issued (and possibly signed)
+ * agreement go, so the step is redone from scratch — Legal re-issues and the employee re-signs. */
+export function deleteLegalVerificationArtifactsForWorkflow(workflowId: string) {
+  const db = getDb()
+  db.prepare('DELETE FROM legal_signoff_records WHERE workflow_id = ?').run(workflowId)
+  db.prepare('DELETE FROM legal_agreements WHERE workflow_id = ?').run(workflowId)
+}
+
+// ---------- Knowledge Base access grants ----------
+// Written by the knowledge_base_access step's "Grant Access" action (see grantKnowledgeBaseAccess
+// in workflow-actions.ts); read by lib/kb-access.ts to decide which Knowledge Base categories an
+// onboarding Employee can see.
+
+export type EmployeeKbGrant = {
+  id: string
+  workflowId: string
+  employeeId: string
+  categories: string[]
+  grantedBy: string
+  grantedAt: string
+}
+
+type EmployeeKbGrantRow = {
+  id: string
+  workflow_id: string
+  employee_id: string
+  categories: string
+  granted_by: string
+  granted_at: string
+}
+
+function mapEmployeeKbGrant(row: EmployeeKbGrantRow): EmployeeKbGrant {
+  return {
+    id: row.id,
+    workflowId: row.workflow_id,
+    employeeId: row.employee_id,
+    categories: JSON.parse(row.categories),
+    grantedBy: row.granted_by,
+    grantedAt: row.granted_at,
+  }
+}
+
+const EMPLOYEE_KB_GRANT_COLUMNS = 'id, workflow_id, employee_id, categories, granted_by, granted_at'
+
+export function createEmployeeKbGrant(input: {
+  workflowId: string
+  employeeId: string
+  categories: string[]
+  grantedBy: string
+  grantedAt?: string
+}): EmployeeKbGrant {
+  const row: EmployeeKbGrantRow = {
+    id: genId('kbgrant'),
     workflow_id: input.workflowId,
-    step_id: input.stepId,
-    approval_id: input.approvalId,
-    summary_text: input.summaryText,
-    generated_at: input.generatedAt ?? nowIso(),
+    employee_id: input.employeeId,
+    categories: JSON.stringify(input.categories),
+    granted_by: input.grantedBy,
+    granted_at: input.grantedAt ?? nowIso(),
   }
   getDb()
-    .prepare(`INSERT INTO it_verification_summaries (${IT_VERIFICATION_SUMMARY_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?)`)
-    .run(row.id, row.workflow_id, row.step_id, row.approval_id, row.summary_text, row.generated_at)
-  return mapItVerificationSummary(row)
+    .prepare(`INSERT INTO employee_kb_grants (${EMPLOYEE_KB_GRANT_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?)`)
+    .run(row.id, row.workflow_id, row.employee_id, row.categories, row.granted_by, row.granted_at)
+  return mapEmployeeKbGrant(row)
 }
 
-export function getLatestItVerificationSummary(workflowId: string): ItVerificationSummary | null {
-  const row = getDb()
+export function listEmployeeKbGrantsByEmployee(employeeId: string): EmployeeKbGrant[] {
+  const rows = getDb()
+    .prepare(`SELECT ${EMPLOYEE_KB_GRANT_COLUMNS} FROM employee_kb_grants WHERE employee_id = ? AND revoked_at IS NULL ORDER BY granted_at`)
+    .all(employeeId) as EmployeeKbGrantRow[]
+  return rows.map(mapEmployeeKbGrant)
+}
+
+export function deleteEmployeeKbGrantsForWorkflow(workflowId: string) {
+  getDb().prepare('DELETE FROM employee_kb_grants WHERE workflow_id = ?').run(workflowId)
+}
+
+// ---------- Workflow audit log ----------
+
+export type WorkflowAuditLogEntry = {
+  id: string
+  workflowId: string
+  stepKey: string
+  action: 'revert'
+  performedBy: string
+  performedAt: string
+  cascadedStepKeys: string[]
+}
+
+type WorkflowAuditLogRow = {
+  id: string
+  workflow_id: string
+  step_key: string
+  action: 'revert'
+  performed_by: string
+  performed_at: string
+  cascaded_step_keys: string
+}
+
+function mapWorkflowAuditLogEntry(row: WorkflowAuditLogRow): WorkflowAuditLogEntry {
+  return {
+    id: row.id,
+    workflowId: row.workflow_id,
+    stepKey: row.step_key,
+    action: row.action,
+    performedBy: row.performed_by,
+    performedAt: row.performed_at,
+    cascadedStepKeys: JSON.parse(row.cascaded_step_keys),
+  }
+}
+
+export function createWorkflowAuditLogEntry(input: {
+  workflowId: string
+  stepKey: string
+  action: 'revert'
+  performedBy: string
+  cascadedStepKeys: string[]
+  performedAt?: string
+  /** Why HR reverted — required for offboarding reverts, optional (null) otherwise. */
+  reason?: string | null
+}): WorkflowAuditLogEntry {
+  const row: WorkflowAuditLogRow = {
+    id: genId('auditlog'),
+    workflow_id: input.workflowId,
+    step_key: input.stepKey,
+    action: input.action,
+    performed_by: input.performedBy,
+    performed_at: input.performedAt ?? nowIso(),
+    cascaded_step_keys: JSON.stringify(input.cascadedStepKeys),
+  }
+  getDb()
     .prepare(
-      `SELECT ${IT_VERIFICATION_SUMMARY_COLUMNS} FROM it_verification_summaries WHERE workflow_id = ? ORDER BY generated_at DESC LIMIT 1`,
+      'INSERT INTO workflow_audit_log (id, workflow_id, step_key, action, performed_by, performed_at, cascaded_step_keys) VALUES (?, ?, ?, ?, ?, ?, ?)',
     )
-    .get(workflowId) as ItVerificationSummaryRow | undefined
-  return row ? mapItVerificationSummary(row) : null
+    .run(row.id, row.workflow_id, row.step_key, row.action, row.performed_by, row.performed_at, row.cascaded_step_keys)
+  if (input.reason) getDb().prepare('UPDATE workflow_audit_log SET reason = ? WHERE id = ?').run(input.reason, row.id)
+  return mapWorkflowAuditLogEntry(row)
 }
 
 // ---------- Dev-only step reset ----------
 // Everything below exists solely to power the dev/testing "reset last completed step" control —
 // never called in production. Deletes are targeted at a single workflow, never cross-workflow.
 
-/** Approvals are referenced by notifications, subtasks, and the two AI-summary tables (all NOT
+/** Approvals are referenced by notifications, subtasks, and step_ai_summaries (all NOT
  * NULL foreign keys) — node's sqlite enforces foreign keys by default, so those child rows must
  * go first or the approval delete below throws a constraint violation. Scoped the same way as the
  * approval delete itself: only rows tied to this workflow+step's approvals, never cross-workflow. */
@@ -1870,6 +2938,9 @@ export function deleteApprovalsForStep(workflowId: string, stepId: string) {
   const approvalSubquery = 'SELECT id FROM approvals WHERE workflow_id = ? AND step_id = ?'
   db.prepare(`DELETE FROM notifications WHERE approval_id IN (${approvalSubquery})`).run(workflowId, stepId)
   db.prepare(`DELETE FROM subtasks WHERE approval_id IN (${approvalSubquery})`).run(workflowId, stepId)
+  db.prepare(`DELETE FROM step_ai_summaries WHERE approval_id IN (${approvalSubquery})`).run(workflowId, stepId)
+  // The legacy per-step summary tables are emptied on startup and never written to, but still carry
+  // an approvals FK — clear them too so a straggler row can never block the approval delete.
   db.prepare(`DELETE FROM asset_allocation_summaries WHERE approval_id IN (${approvalSubquery})`).run(workflowId, stepId)
   db.prepare(`DELETE FROM it_verification_summaries WHERE approval_id IN (${approvalSubquery})`).run(workflowId, stepId)
   db.prepare('DELETE FROM approvals WHERE workflow_id = ? AND step_id = ?').run(workflowId, stepId)

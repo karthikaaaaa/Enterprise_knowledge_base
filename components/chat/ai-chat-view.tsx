@@ -15,6 +15,7 @@ import {
   Loader2,
 } from 'lucide-react'
 import { Markdown } from '@/components/chat/markdown'
+import { useAuth } from '@/components/auth/auth-provider'
 
 type Source = { id: string; name: string }
 type Message = {
@@ -64,6 +65,7 @@ function relativeTime(ts: number) {
 }
 
 export function AiChatView() {
+  const { user } = useAuth()
   const [conversations, setConversations] = useState<Conversation[]>([])
   const [activeId, setActiveId] = useState<string | null>(null)
   const [input, setInput] = useState('')
@@ -177,7 +179,8 @@ export function AiChatView() {
     try {
       const response = await fetch('/api/chat', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        // Identifies the caller so answers are scoped to the Knowledge Base categories they can see.
+        headers: { 'Content-Type': 'application/json', ...(user?.email ? { 'x-user-email': user.email } : {}) },
         body: JSON.stringify({ message: trimmed }),
       })
       const data = await response.json()

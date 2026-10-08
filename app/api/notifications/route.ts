@@ -8,5 +8,5 @@ export async function GET(request: Request) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   }
 
-  return NextResponse.json({ notifications: listNotificationsForRole(caller.role.id) })
+  return NextResponse.json({ notifications: listNotificationsForRole(caller.role.id, caller.user.id) })
 }

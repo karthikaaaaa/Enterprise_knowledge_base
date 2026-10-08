@@ -1,6 +1,7 @@
 import { GoogleGenAI } from '@google/genai'
-import { saveFile } from '@/lib/storage'
-import { addDocument, type StoredDocument } from '@/lib/document-store'
+import { saveFile, deleteFile } from '@/lib/storage'
+import { addDocument, deleteDocument, type StoredDocument } from '@/lib/document-store'
+import { deleteChunksForDocument } from '@/lib/chunk-store'
 import { indexDocument } from '@/lib/rag'
 
 const SYSTEM_PROMPT =
@@ -109,4 +110,15 @@ export async function createEmployeeProfileKbEntry(
   indexDocument(document).catch((error) => console.error('[v0] Failed to index employee profile KB entry:', error))
 
   return { markdown, summary, document }
+}
+
+/** Removes one auto-created KB entry from all three places it lives: its documents.json record,
+ * its file in storage/documents/, and its chunks in storage/chunks.db (so AI Chat stops citing
+ * it). Safe to call for a document that's already gone. Used by Revert, the dev reset, and
+ * hr_approval regeneration — the KB lives outside workflows.db, so none of their sqlite
+ * transactions can clean it up on their own. */
+export async function retractKbDocument(documentId: string) {
+  const removed = await deleteDocument(documentId)
+  if (removed) await deleteFile(removed.storedFilename)
+  await deleteChunksForDocument(documentId)
 }

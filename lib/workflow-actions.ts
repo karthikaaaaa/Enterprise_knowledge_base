@@ -21,10 +21,12 @@ import {
   runInTransaction,
   createHrApprovalProfileEntry,
   getLatestItAccountReport,
-  createAssetAllocationSummary,
-  getLatestAssetAllocationSummary,
-  createItVerificationSummary,
-  getLatestItVerificationSummary,
+  createStepAiSummary,
+  getLatestStepAiSummary,
+  getLatestDocumentVerificationResult,
+  listHrApprovalProfileEntriesForWorkflow,
+  createEmployeeKbGrant,
+  deleteEmployeeKbGrantsForWorkflow,
   deleteApprovalsForStep,
   deleteEmployeeDetailSubmissionsForWorkflow,
   deleteEmployeeDocumentsForWorkflow,
@@ -32,11 +34,26 @@ import {
   deleteHrApprovalProfileEntriesForWorkflow,
   deleteManagerApprovalReportsForWorkflow,
   deleteItAccountReportsForWorkflow,
+  createAiVerificationRun,
+  listEmployeeFinanceDetails,
+  getPayrollRecordByWorkflow,
+  getExpenseAccountByWorkflow,
+  getFinanceSignoffRecordByWorkflow,
+  getLegalAgreementByWorkflow,
+  getLegalSignoffRecordByWorkflow,
   type EmployeeDetailSubmission,
 } from '@/lib/workflow-store'
-import { createEmployeeProfileKbEntry } from '@/lib/hr-approval-kb'
+import { createEmployeeProfileKbEntry, retractKbDocument } from '@/lib/hr-approval-kb'
 import { generateAssetAllocationSummary } from '@/lib/asset-allocation-report'
 import { generateItVerificationSummary } from '@/lib/it-verification-report'
+import { runAiVerification, type AiVerificationLog, type NarrativeGenerator } from '@/lib/ai-verification-log'
+import { LEGAL_VERIFICATION_CONFIG, type LegalVerificationSource } from '@/lib/legal-verification-log'
+import { isOffboardingReviewKey, runOffboardingReview, type OffboardingReviewKey } from '@/lib/offboarding/reviews'
+import {
+  FINANCE_VERIFICATION_CONFIG,
+  type FinanceDetailValue,
+  type FinanceVerificationSource,
+} from '@/lib/finance-verification-log'
 import {
   getWorkflowStepDetail,
   listWorkflowStepDetails,
@@ -48,6 +65,8 @@ import { humanizeStepName } from '@/lib/workflow-format'
 const ASSET_ALLOCATION_STEP_NAME = 'asset_allocation'
 const IT_ACCOUNT_CREATION_STEP_NAME = 'it_account_creation'
 const IT_VERIFICATION_STEP_NAME = 'it_verification'
+const FINANCE_VERIFICATION_STEP_NAME = 'finance_verification'
+const LEGAL_VERIFICATION_STEP_NAME = 'legal_verification'
 
 const DEPARTMENT_FIXED = new Set(['IT', 'Finance', 'Legal', 'Manager'])
 
@@ -62,6 +81,8 @@ export type WorkflowActionError =
   | 'already_verified'
   | 'step_locked'
   | 'already_submitted'
+  | 'precondition_not_met'
+  | 'already_granted'
 
 function employeeDisplayName(workflowId: string): string {
   const workflow = getWorkflow(workflowId)
@@ -101,6 +122,8 @@ export async function notifyDepartmentStep(
     await notifyAssetAllocation(workflowId, step, department)
   } else if (step.stepName === IT_VERIFICATION_STEP_NAME) {
     await notifyItVerification(workflowId, step, department)
+  } else if (step.stepName === FINANCE_VERIFICATION_STEP_NAME || step.stepName === LEGAL_VERIFICATION_STEP_NAME) {
+    await notifyDepartmentVerification(workflowId, step, department)
   } else {
     const employeeName = employeeDisplayName(workflowId)
     runInTransaction(() => {
@@ -144,7 +167,7 @@ async function notifyAssetAllocation(
 
   runInTransaction(() => {
     const approval = createApproval({ workflowId, stepId: step.id, approverId: department.approverId, status: 'allocated' })
-    createAssetAllocationSummary({ workflowId, stepId: step.id, approvalId: approval.id, summaryText })
+    createStepAiSummary({ workflowId, stepId: step.id, approvalId: approval.id, stepKey: 'asset_allocation', summaryText })
     createNotification({
       roleId: department.roleId,
       approvalId: approval.id,
@@ -192,7 +215,7 @@ async function maybeGenerateItVerificationSummary(workflowId: string) {
   const steps = listWorkflowStepDetails(workflowId)
   const itVerificationStep = steps.find((s) => s.stepName === IT_VERIFICATION_STEP_NAME)
   if (!itVerificationStep?.approval || itVerificationStep.approval.status === 'verified') return
-  if (getLatestItVerificationSummary(workflowId)) return
+  if (getLatestStepAiSummary(workflowId, 'it_verification')) return
 
   const itAccountStep = steps.find((s) => s.stepName === IT_ACCOUNT_CREATION_STEP_NAME)
   const assetStep = steps.find((s) => s.stepName === ASSET_ALLOCATION_STEP_NAME)
@@ -204,7 +227,7 @@ async function maybeGenerateItVerificationSummary(workflowId: string) {
   const employeeName = employeeDisplayName(workflowId)
   const submission = getEmployeeDetailSubmissionByWorkflow(workflowId)
   const accountReport = getLatestItAccountReport(workflowId)
-  const assetSummary = getLatestAssetAllocationSummary(workflowId)
+  const assetSummary = getLatestStepAiSummary(workflowId, 'asset_allocation')
   const employee = getEmployeeById(getWorkflow(workflowId)!.employeeId)
   const loginEmail = accountReport?.email ?? (employee ? getUserById(employee.userId)?.email : undefined) ?? '—'
 
@@ -216,7 +239,218 @@ async function maybeGenerateItVerificationSummary(workflowId: string) {
     assetSummary: assetSummary?.summaryText ?? 'Standard asset kit assigned.',
   })
 
-  createItVerificationSummary({ workflowId, stepId: itVerificationStep.id, approvalId: approval.id, summaryText })
+  createStepAiSummary({
+    workflowId,
+    stepId: itVerificationStep.id,
+    approvalId: approval.id,
+    stepKey: 'it_verification',
+    summaryText,
+  })
+}
+
+/** finance_verification (Fatima) and legal_verification (Lucas): same single-summary shape as
+ * asset_allocation — no subtasks, the AI pre-check is generated before the approval row exists so
+ * it's already there when the task lands in the department's queue, and the approval stays
+ * 'allocated' until the department head clicks Verify on their Tasks card (which moves it to
+ * 'completed'; HR's own Verify on the timeline is still required after that). */
+async function notifyDepartmentVerification(
+  workflowId: string,
+  step: WorkflowStepDetail,
+  department: { roleId: string; approverId: string | null },
+) {
+  const employeeName = employeeDisplayName(workflowId)
+  const stepKey = step.stepName === FINANCE_VERIFICATION_STEP_NAME ? 'finance_verification' : 'legal_verification'
+  // Structured, evidence-backed review log (lib/finance-verification-log.ts /
+  // lib/legal-verification-log.ts). The old prose summary row is still written, from shortSummary,
+  // so every existing reader keeps working.
+  const log = await runStructuredReview(stepKey, workflowId)
+  runInTransaction(() => {
+    const approval = createApproval({ workflowId, stepId: step.id, approverId: department.approverId, status: 'allocated' })
+    createStepAiSummary({ workflowId, stepId: step.id, approvalId: approval.id, stepKey, summaryText: log.shortSummary, generatedAt: log.generatedAt })
+    createAiVerificationRun({ id: log.runId, workflowId, stepKey, approvalId: approval.id, result: log, generatedBy: null })
+    createNotification({
+      roleId: department.roleId,
+      approvalId: approval.id,
+      message: `${humanizeStepName(step.stepName)} needed for ${employeeName}`,
+    })
+  })
+}
+
+export type StructuredReviewStepKey = 'finance_verification' | 'legal_verification' | OffboardingReviewKey
+
+/** One AI review run for any structured step, against the current records. Offboarding steps also
+ * (idempotently) apply their actions first — see lib/offboarding/reviews.ts. */
+async function runStructuredReview(
+  stepKey: StructuredReviewStepKey,
+  workflowId: string,
+  generate?: NarrativeGenerator,
+  requestedByUserId: string | null = null,
+): Promise<AiVerificationLog> {
+  if (isOffboardingReviewKey(stepKey)) return runOffboardingReview(stepKey, workflowId, requestedByUserId, generate)
+  return stepKey === 'finance_verification'
+    ? runAiVerification(FINANCE_VERIFICATION_CONFIG, compileFinanceVerificationSource(workflowId), generate)
+    : runAiVerification(LEGAL_VERIFICATION_CONFIG, compileLegalVerificationSource(workflowId), generate)
+}
+
+/** The records the finance pre-check reads, straight from the source tables. Evidence in the
+ * resulting log cites these exact ids and values. File bytes are deliberately left out. */
+export function compileFinanceVerificationSource(workflowId: string): FinanceVerificationSource {
+  const workflow = getWorkflow(workflowId)
+  const employee = workflow ? getEmployeeById(workflow.employeeId) : null
+  const submission = getEmployeeDetailSubmissionByWorkflow(workflowId)
+  const check = getLatestDocumentVerificationResult(workflowId)
+  const hrEntries = listHrApprovalProfileEntriesForWorkflow(workflowId)
+  return {
+    workflowId,
+    employee: {
+      id: employee?.id ?? '',
+      name: employee ? `${employee.firstName} ${employee.lastName}` : 'the employee',
+      dateOfJoining: employee?.dateOfJoining ?? null,
+    },
+    submission: submission
+      ? {
+          id: submission.id,
+          fullName: submission.fullName,
+          email: submission.email,
+          phone: submission.phone,
+          roleTitle: submission.roleTitle,
+          department: submission.department,
+          startDate: submission.startDate,
+        }
+      : null,
+    documents: listEmployeeDocumentsByWorkflow(workflowId).map((d) => ({
+      id: d.id,
+      documentType: d.documentType,
+      fileName: d.fileName,
+      extractedFields: d.extractedFields,
+    })),
+    documentCheck: check ? { id: check.id, overallStatus: check.overallStatus } : null,
+    hrProfileEntryId: hrEntries.at(-1)?.id ?? null,
+    financeDetails: latestFinanceDetails(workflowId),
+    payrollRecord: payrollRecordRef(workflowId),
+    expenseAccount: expenseAccountRef(workflowId),
+    signoffRecord: signoffRecordRef(workflowId),
+  }
+}
+
+function userName(userId: string) {
+  return getUserById(userId)?.name ?? 'Finance'
+}
+
+function expenseAccountRef(workflowId: string): FinanceVerificationSource['expenseAccount'] {
+  const account = getExpenseAccountByWorkflow(workflowId)
+  return account
+    ? { id: account.id, createdAt: account.createdAt, createdBy: userName(account.createdBy), costCenter: account.costCenter }
+    : null
+}
+
+function signoffRecordRef(workflowId: string): FinanceVerificationSource['signoffRecord'] {
+  const record = getFinanceSignoffRecordByWorkflow(workflowId)
+  return record ? { id: record.id, createdAt: record.createdAt, createdBy: userName(record.createdBy) } : null
+}
+
+function payrollRecordRef(workflowId: string): FinanceVerificationSource['payrollRecord'] {
+  const record = getPayrollRecordByWorkflow(workflowId)
+  if (!record) return null
+  return {
+    id: record.id,
+    createdAt: record.createdAt,
+    payFrequency: record.payFrequency,
+    createdBy: getUserById(record.createdBy)?.name ?? 'Finance',
+  }
+}
+
+/** Newest non-empty value per field across every employee_finance_details row (a request may
+ * cover only some fields), each tagged with the row it came from so evidence can cite it. */
+function latestFinanceDetails(workflowId: string): FinanceVerificationSource['financeDetails'] {
+  const result: NonNullable<FinanceVerificationSource['financeDetails']> = {}
+  const keys = ['accountHolder', 'bankAccountNumber', 'bankRoutingCode', 'taxId'] as const
+  for (const row of listEmployeeFinanceDetails(workflowId)) {
+    for (const key of keys) {
+      const value = row[key]?.trim()
+      if (!result[key] && value) {
+        result[key] = { value, recordId: row.id, fileName: row.fileName } satisfies FinanceDetailValue
+      }
+    }
+  }
+  return result
+}
+
+export type RerunStructuredReviewError = 'workflow_not_found' | 'step_not_found' | 'not_notified' | 'already_verified'
+export type RerunFinanceVerificationError = RerunStructuredReviewError
+
+/** "Re-run AI" on a structured review (Fatima's / Lucas's panel, or automatically after a record is
+ * created): a fresh run against the current records, appended to the history (nothing is
+ * overwritten). Only while the step is still awaiting its department — once they've verified it,
+ * the run they signed off on is final. */
+export async function rerunStructuredReview(
+  workflowId: string,
+  stepKey: StructuredReviewStepKey,
+  requestedByUserId: string,
+  generate?: NarrativeGenerator,
+): Promise<{ ok: true; runId: string } | { ok: false; error: RerunStructuredReviewError }> {
+  if (!getWorkflow(workflowId)) return { ok: false, error: 'workflow_not_found' }
+  const step = getWorkflowSteps(workflowId).find((s) => s.stepName === stepKey)
+  if (!step) return { ok: false, error: 'step_not_found' }
+  const approval = getLatestApprovalForStep(workflowId, step.id)
+  if (!approval) return { ok: false, error: 'not_notified' }
+  if (approval.status === 'completed' || approval.status === 'verified') return { ok: false, error: 'already_verified' }
+
+  const log = await runStructuredReview(stepKey, workflowId, generate, requestedByUserId)
+  runInTransaction(() => {
+    createStepAiSummary({ workflowId, stepId: step.id, approvalId: approval.id, stepKey, summaryText: log.shortSummary, generatedAt: log.generatedAt })
+    createAiVerificationRun({ id: log.runId, workflowId, stepKey, approvalId: approval.id, result: log, generatedBy: requestedByUserId })
+  })
+  return { ok: true, runId: log.runId }
+}
+
+export function rerunFinanceVerification(workflowId: string, requestedByUserId: string, generate?: NarrativeGenerator) {
+  return rerunStructuredReview(workflowId, 'finance_verification', requestedByUserId, generate)
+}
+
+/** The records the legal pre-check reads, straight from the source tables. */
+export function compileLegalVerificationSource(workflowId: string): LegalVerificationSource {
+  const workflow = getWorkflow(workflowId)
+  const employee = workflow ? getEmployeeById(workflow.employeeId) : null
+  const submission = getEmployeeDetailSubmissionByWorkflow(workflowId)
+  const check = getLatestDocumentVerificationResult(workflowId)
+  const agreement = getLegalAgreementByWorkflow(workflowId)
+  const signoff = getLegalSignoffRecordByWorkflow(workflowId)
+  return {
+    workflowId,
+    employee: {
+      id: employee?.id ?? '',
+      name: employee ? `${employee.firstName} ${employee.lastName}` : 'the employee',
+      dateOfJoining: employee?.dateOfJoining ?? null,
+    },
+    submission: submission
+      ? {
+          id: submission.id,
+          fullName: submission.fullName,
+          roleTitle: submission.roleTitle,
+          department: submission.department,
+          startDate: submission.startDate,
+        }
+      : null,
+    documents: listEmployeeDocumentsByWorkflow(workflowId).map((d) => ({
+      id: d.id,
+      documentType: d.documentType,
+      fileName: d.fileName,
+      extractedFields: d.extractedFields,
+    })),
+    documentCheck: check ? { id: check.id, overallStatus: check.overallStatus } : null,
+    agreement: agreement
+      ? {
+          id: agreement.id,
+          version: agreement.version,
+          issuedAt: agreement.issuedAt,
+          issuedBy: userName(agreement.issuedBy),
+          signedName: agreement.signedName,
+          signedAt: agreement.signedAt,
+        }
+      : null,
+    signoffRecord: signoff ? { id: signoff.id, createdAt: signoff.createdAt, createdBy: userName(signoff.createdBy) } : null,
+  }
 }
 
 export type AdhocStepInput = {
@@ -387,10 +621,18 @@ export function submitEmployeeDetails(
 
     let approvalId: string
     if (existingApproval) {
-      updateApprovalStatus(existingApproval.id, 'completed', {})
+      updateApprovalStatus(existingApproval.id, 'completed', { completedBy: submittedByUserId, completedAt: submittedAt })
       approvalId = existingApproval.id
     } else {
-      approvalId = createApproval({ workflowId, stepId: step.id, approverId: null, status: 'completed', createdAt: submittedAt }).id
+      approvalId = createApproval({
+        workflowId,
+        stepId: step.id,
+        approverId: null,
+        status: 'completed',
+        completedBy: submittedByUserId,
+        completedAt: submittedAt,
+        createdAt: submittedAt,
+      }).id
     }
 
     const hrRole = getRoleByName('HR')
@@ -481,6 +723,7 @@ export function uploadEmployeeDocument(
   if (existingApproval?.status === 'verified') return { ok: false, error: 'already_submitted' }
 
   const wasAlreadyComplete = existingApproval?.status === 'completed'
+  const completedAt = new Date().toISOString()
 
   runInTransaction(() => {
     createEmployeeDocument({
@@ -500,10 +743,17 @@ export function uploadEmployeeDocument(
 
     let approvalId: string
     if (existingApproval) {
-      updateApprovalStatus(existingApproval.id, 'completed', {})
+      updateApprovalStatus(existingApproval.id, 'completed', { completedBy: uploadedByUserId, completedAt })
       approvalId = existingApproval.id
     } else {
-      approvalId = createApproval({ workflowId, stepId: step.id, approverId: null, status: 'completed' }).id
+      approvalId = createApproval({
+        workflowId,
+        stepId: step.id,
+        approverId: null,
+        status: 'completed',
+        completedBy: uploadedByUserId,
+        completedAt,
+      }).id
     }
 
     const hrRole = getRoleByName('HR')
@@ -618,10 +868,18 @@ export function runAiDocumentVerification(
 
     let approvalId: string
     if (existingApproval) {
-      updateApprovalStatus(existingApproval.id, 'completed', {})
+      updateApprovalStatus(existingApproval.id, 'completed', { completedBy: runByUserId, completedAt: runAt })
       approvalId = existingApproval.id
     } else {
-      approvalId = createApproval({ workflowId, stepId: step.id, approverId: runByUserId, status: 'completed', createdAt: runAt }).id
+      approvalId = createApproval({
+        workflowId,
+        stepId: step.id,
+        approverId: runByUserId,
+        status: 'completed',
+        completedBy: runByUserId,
+        completedAt: runAt,
+        createdAt: runAt,
+      }).id
     }
 
     const hrRole = getRoleByName('HR')
@@ -654,8 +912,8 @@ export type HrApprovalProfileEntryOutcome = {
  * runAiDocumentVerification above). This only completes the step; pushing it to 'verified' (and
  * so unlocking manager_approval / showing "verified" on the employee side) goes through the same
  * generic Verify button/action every other step uses, not a bespoke one-shot approve. Re-running
- * before verification regenerates the preview and saves a new KB doc — the previous one it
- * created isn't retracted, matching the dev-reset step's "don't retract KB docs" behavior. */
+ * before verification regenerates the preview and saves a new KB doc, then retracts the one(s) an
+ * earlier run created — so there's only ever one directory entry per employee in the KB. */
 export async function generateHrApprovalProfileEntry(
   workflowId: string,
   runByUserId: string,
@@ -677,6 +935,7 @@ export async function generateHrApprovalProfileEntry(
 
   const employee = getEmployeeById(workflow.employeeId)
   const manager = employee?.managerId ? getEmployeeById(employee.managerId) : null
+  const previousDocumentIds = listHrApprovalProfileEntriesForWorkflow(workflowId).map((e) => e.documentId)
 
   const { markdown, summary, document } = await createEmployeeProfileKbEntry({
     fullName: submission.fullName,
@@ -704,10 +963,18 @@ export async function generateHrApprovalProfileEntry(
 
     let approvalId: string
     if (existingApproval) {
-      updateApprovalStatus(existingApproval.id, 'completed', {})
+      updateApprovalStatus(existingApproval.id, 'completed', { completedBy: runByUserId, completedAt: generatedAt })
       approvalId = existingApproval.id
     } else {
-      approvalId = createApproval({ workflowId, stepId: step.id, approverId: runByUserId, status: 'completed', createdAt: generatedAt }).id
+      approvalId = createApproval({
+        workflowId,
+        stepId: step.id,
+        approverId: runByUserId,
+        status: 'completed',
+        completedBy: runByUserId,
+        completedAt: generatedAt,
+        createdAt: generatedAt,
+      }).id
     }
 
     const hrRole = getRoleByName('HR')
@@ -720,11 +987,85 @@ export async function generateHrApprovalProfileEntry(
     }
   })
 
+  // Only after the new entry is safely recorded — if anything above threw, the old KB doc stays.
+  for (const documentId of previousDocumentIds) {
+    if (documentId !== document.id) await retractKbDocument(documentId)
+  }
+
   return {
     ok: true,
     step: getWorkflowStepDetail(workflowId, step.id)!,
     entry: { markdown, summary, documentId: document.id, documentName: document.originalName, generatedAt },
   }
+}
+
+// ---------- knowledge_base_access: Grant Access ----------
+
+const KNOWLEDGE_BASE_ACCESS_STEP_NAME = 'knowledge_base_access'
+const COMPLETED_MARKER_STEP_NAME = 'completed'
+
+/** The categories opened up by this step. Hardcoded to Policies for now — extend this list if more
+ * Knowledge Base categories should open at this point in onboarding. */
+export const KB_ACCESS_DEFAULT_CATEGORIES = ['Policies']
+
+/** HR-performed, like hr_approval: granting IS the verification, so this records the grant and
+ * moves knowledge_base_access straight to 'verified' in one go — there's no department to wait on
+ * and no separate HR Verify click afterward. If every step left after it is just the 'completed'
+ * marker, that marker is verified too and the whole workflow closes (status 'completed') — nothing
+ * else ever completes that marker step, since it has no action of its own. */
+export function grantKnowledgeBaseAccess(
+  workflowId: string,
+  grantedByUserId: string,
+): { ok: true; steps: WorkflowStepDetail[]; workflowStatus: string } | { ok: false; error: WorkflowActionError } {
+  const workflow = getWorkflow(workflowId)
+  if (!workflow) return { ok: false, error: 'workflow_not_found' }
+
+  const steps = listWorkflowStepDetails(workflowId)
+  const index = steps.findIndex((s) => s.stepName === KNOWLEDGE_BASE_ACCESS_STEP_NAME)
+  if (index === -1) return { ok: false, error: 'step_not_found' }
+  const step = steps[index]
+
+  const legalStep = steps.find((s) => s.stepName === LEGAL_VERIFICATION_STEP_NAME)
+  if (legalStep?.approval?.status !== 'verified' || step.locked) return { ok: false, error: 'precondition_not_met' }
+  if (step.approval) return { ok: false, error: 'already_granted' }
+
+  const now = new Date().toISOString()
+  const remaining = steps.slice(index + 1)
+  const closesWorkflow = remaining.every((s) => s.stepName === COMPLETED_MARKER_STEP_NAME && !s.approval)
+
+  runInTransaction(() => {
+    createEmployeeKbGrant({
+      workflowId,
+      employeeId: workflow.employeeId,
+      categories: KB_ACCESS_DEFAULT_CATEGORIES,
+      grantedBy: grantedByUserId,
+      grantedAt: now,
+    })
+
+    const createVerifiedApproval = (stepId: string) =>
+      createApproval({
+        workflowId,
+        stepId,
+        approverId: grantedByUserId,
+        status: 'verified',
+        completedBy: grantedByUserId,
+        completedAt: now,
+        verifiedBy: grantedByUserId,
+        verifiedAt: now,
+        createdAt: now,
+      })
+
+    createVerifiedApproval(step.id)
+
+    if (closesWorkflow) {
+      for (const marker of remaining) createVerifiedApproval(marker.id)
+      updateWorkflowCurrentStep(workflowId, null, 'completed')
+    } else {
+      updateWorkflowCurrentStep(workflowId, remaining[0]?.id ?? null)
+    }
+  })
+
+  return { ok: true, steps: listWorkflowStepDetails(workflowId), workflowStatus: getWorkflow(workflowId)!.status }
 }
 
 // ---------- Dev-only: reset the last completed step ----------
@@ -737,7 +1078,7 @@ export type ResetLastStepResult =
  * furthest-along verified step — "bottom up" — clearing whatever data backs it, without
  * touching any earlier step. There's never a downstream step to also invalidate: by definition
  * the step being reset is the last one that was ever verified. */
-export function resetLastVerifiedStep(workflowId: string): ResetLastStepResult {
+export async function resetLastVerifiedStep(workflowId: string): Promise<ResetLastStepResult> {
   const workflow = getWorkflow(workflowId)
   if (!workflow) return { ok: false, error: 'workflow_not_found' }
 
@@ -753,6 +1094,14 @@ export function resetLastVerifiedStep(workflowId: string): ResetLastStepResult {
 
   const step = steps[targetIndex]
 
+  // Same KB cleanup as a Revert of hr_approval (see lib/workflow-revert.ts) — done before the
+  // transaction deletes the profile-entry rows that are the only record of which docs to remove.
+  if (step.stepName === 'hr_approval') {
+    for (const entry of listHrApprovalProfileEntriesForWorkflow(workflowId)) {
+      await retractKbDocument(entry.documentId)
+    }
+  }
+
   runInTransaction(() => {
     switch (step.stepName) {
       case 'employee_details':
@@ -765,8 +1114,7 @@ export function resetLastVerifiedStep(workflowId: string): ResetLastStepResult {
         deleteDocumentVerificationResultsForWorkflow(workflowId)
         break
       case 'hr_approval':
-        // The generated-profile preview is cleared; any KB doc it already created is left in
-        // place (same "don't retract KB docs" behavior noted on generateHrApprovalProfileEntry).
+        // The KB doc(s) it created were already retracted above, outside the transaction.
         deleteHrApprovalProfileEntriesForWorkflow(workflowId)
         break
       case 'manager_approval':
@@ -775,10 +1123,13 @@ export function resetLastVerifiedStep(workflowId: string): ResetLastStepResult {
       case 'it_account_creation':
         deleteItAccountReportsForWorkflow(workflowId)
         break
+      case 'knowledge_base_access':
+        deleteEmployeeKbGrantsForWorkflow(workflowId)
+        break
       default:
-        // Anything else: no separate per-workflow cleanup needed. asset_allocation and
-        // it_verification's AI summaries are approval-scoped (not workflow-scoped like the cases
-        // above), so deleteApprovalsForStep below already clears them.
+        // Anything else: no separate per-workflow cleanup needed. The AI-summary steps
+        // (asset_allocation, it_verification, finance/legal_verification) are approval-scoped, so
+        // deleteApprovalsForStep below already clears them.
         break
     }
     deleteApprovalsForStep(workflowId, step.id)

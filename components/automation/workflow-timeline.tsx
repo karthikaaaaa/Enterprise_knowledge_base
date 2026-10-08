@@ -1,6 +1,6 @@
 'use client'
 
-import { useState } from 'react'
+import { useState, type ReactNode } from 'react'
 import Link from 'next/link'
 import {
   ArrowLeft,
@@ -20,11 +20,29 @@ import {
   Sparkles,
   Upload,
   FileText,
+  Undo2,
+  KeyRound,
 } from 'lucide-react'
+import useSWR, { useSWRConfig } from 'swr'
 import { cn } from '@/lib/utils'
-import { formatWorkflowDate } from '@/lib/workflow-format'
+import { formatWorkflowDate, formatWorkflowDateTime } from '@/lib/workflow-format'
+import { useAuth } from '@/components/auth/auth-provider'
+import { authedFetcher } from '@/lib/api-client'
+import type { AiLogHrSummary, AiVerificationLog } from '@/lib/ai-verification-log'
+import {
+  AiReviewLog,
+  AiReviewShortSummary,
+  openAuthedLink,
+  type AiReviewInfo,
+  type AiRunHistoryItem,
+} from '@/components/verification/ai-review-log'
+import { InfoRequestStatus, RequestEmployeeInfoForm, type InfoRequestSummary } from '@/components/verification/info-request'
+import { canRequestFromRun } from '@/lib/info-request-items'
 
 export type StepStatus = 'completed' | 'in-progress' | 'pending'
+
+/** Name + role (+ initials for the avatar chip) behind "In charge" / "Completed by" / "Verified by". */
+export type StepPersonRef = { name: string; role: string; initials: string }
 
 export type WorkflowStep = {
   id: string
@@ -100,6 +118,46 @@ export type WorkflowStep = {
    * it_account_creation AND asset_allocation are both verified. Display-only here, same shape as
    * assetAllocationSummary. */
   itVerificationSummary?: SimpleAiSummary | null
+  /** finance_verification / legal_verification only: the AI-generated pre-check the department
+   * head reviewed before clicking Verify on their Tasks card. Display-only here, same as above. */
+  departmentSummary?: { summary: SimpleAiSummary; badgeLabel: string } | null
+  /** finance_verification only, HR/Administrator only: the structured AI review's short summary
+   * (status, missing data, reviewer sign-off). Takes precedence over departmentSummary on the card;
+   * View Details opens the full log read-only from `fullLogUrl`. Optional — omitted, the card renders
+   * exactly as before. */
+  structuredReview?: {
+    summary: AiLogHrSummary
+    review: AiReviewInfo | null
+    badgeLabel: string
+    fullLogUrl: string
+    /** Latest "request info from employee", if any, and what's needed to raise a new one. Only
+     * steps that set allowInfoRequest (finance_verification) offer the request button. */
+    infoRequest?: InfoRequestSummary | null
+    allowInfoRequest?: boolean
+    /** legal_verification: an issued agreement still waiting on the employee's signature. */
+    pendingSignature?: { title: string; issuedAt: string } | null
+    workflowId?: string
+    /** SWR key to revalidate after HR raises a request. */
+    refreshKey?: string
+  } | null
+  /** knowledge_base_access only: HR/Administrator can grant access once legal_verification is
+   * verified and the step hasn't been granted yet. Granting verifies the step directly. */
+  canGrantKbAccess?: boolean
+  /** Optional step-specific content rendered inside the expanded card, above the status row (used
+   * by offboarding's panels). Omitted, the card renders exactly as before. */
+  extraPanel?: ReactNode
+  /** Who owns this step right now — shown in every card's expanded panel, above the existing
+   * description/status content. Always present once the step exists. */
+  inCharge?: StepPersonRef | null
+  /** When this step was assigned/notified — null until then. */
+  assignedAt?: string | null
+  completedByPerson?: StepPersonRef | null
+  completedAt?: string | null
+  verifiedByPerson?: StepPersonRef | null
+  verifiedAt?: string | null
+  /** True only for HR, only when ENABLE_STEP_DEV_CONTROLS is on, and only once this step has
+   * actually been started (never for a still-pending step). */
+  canRevert?: boolean
 }
 
 export type DocumentFieldDef = { key: string; label: string; isDate?: boolean }
@@ -217,10 +275,15 @@ type Employee = { name: string; role: string; date: string; label: string }
 /** Testing-only controls (Reset Last Step) never render in a production build, regardless of who's viewing. */
 const DEV_CONTROLS_ENABLED = process.env.NODE_ENV !== 'production'
 
+/** Gates the Revert control's render — the server route enforces the same flag independently, so
+ * this only ever hides the button, it's never the actual authorization boundary. */
+const REVERT_ENABLED = process.env.NEXT_PUBLIC_ENABLE_STEP_DEV_CONTROLS === 'true'
+
 export function WorkflowTimeline({
   employee,
   steps,
   canManage = false,
+  canRevert = false,
   onNotify,
   onAddAdhocStep,
   onVerify,
@@ -229,6 +292,11 @@ export function WorkflowTimeline({
   onRunAiVerification,
   onGenerateHrProfile,
   onResetLastStep,
+  onRevert,
+  onGrantKbAccess,
+  banner,
+  requireRevertReason = false,
+  revertWarningFor,
 }: {
   employee: Employee
   steps: WorkflowStep[]
@@ -249,6 +317,20 @@ export function WorkflowTimeline({
   /** Only set for the Employee viewing their own workflow, and only wired up outside production —
    * undoes just the single furthest-along verified step so it can be redone with different data. */
   onResetLastStep?: () => Promise<void>
+  /** HR only — never Administrator, Manager, or a department login. Combined with REVERT_ENABLED
+   * and each step's own canRevert (not pending) to decide whether a given card's button shows. */
+  canRevert?: boolean
+  onRevert?: (stepId: string, reason?: string) => Promise<void>
+  /** Offboarding: the revert dialog asks for a reason, which is required. Off by default. */
+  requireRevertReason?: boolean
+  /** Extra warning shown in the revert dialog for a given step (e.g. reverting Exit Initiated undoes
+   * the whole offboarding). Omitted / null: no extra warning, as before. */
+  revertWarningFor?: (step: WorkflowStep) => string | null
+  /** Only set for HR/Administrator — the knowledge_base_access step's "Grant Access" action. */
+  onGrantKbAccess?: (stepId: string) => Promise<void>
+  /** Optional content rendered between the progress header and the timeline (e.g. the employee's
+   * "Finance needs your details" card). Omitted, the page renders exactly as before. */
+  banner?: ReactNode
 }) {
   const [expanded, setExpanded] = useState<number | null>(
     steps.findIndex((s) => s.status === 'in-progress'),
@@ -266,6 +348,12 @@ export function WorkflowTimeline({
   const [resetConfirmOpen, setResetConfirmOpen] = useState(false)
   const [resetting, setResetting] = useState(false)
   const [resetError, setResetError] = useState<string | null>(null)
+  const [revertTarget, setRevertTarget] = useState<WorkflowStep | null>(null)
+  const [reverting, setReverting] = useState(false)
+  const [revertError, setRevertError] = useState<string | null>(null)
+  const [revertReason, setRevertReason] = useState('')
+  const [grantingStepId, setGrantingStepId] = useState<string | null>(null)
+  const [grantError, setGrantError] = useState<{ stepId: string; message: string } | null>(null)
 
   const completed = steps.filter((s) => s.status === 'completed').length
   const percent = Math.round((completed / steps.length) * 100)
@@ -309,6 +397,19 @@ export function WorkflowTimeline({
     }
   }
 
+  async function handleGrantKbAccess(stepId: string) {
+    if (!onGrantKbAccess) return
+    setGrantingStepId(stepId)
+    setGrantError(null)
+    try {
+      await onGrantKbAccess(stepId)
+    } catch (error) {
+      setGrantError({ stepId, message: error instanceof Error ? error.message : 'Failed to grant access' })
+    } finally {
+      setGrantingStepId(null)
+    }
+  }
+
   async function handleResetLastStep() {
     if (!onResetLastStep) return
     setResetting(true)
@@ -324,6 +425,35 @@ export function WorkflowTimeline({
   }
 
   const lastCompletedStep = [...steps].reverse().find((s) => s.status === 'completed')
+
+  /** Every step after `step` that isn't still pending — the same "cascade forward, stop at the
+   * first pending step" rule the server applies, computed here from the steps already in hand so
+   * the confirm dialog can name them without a round trip. */
+  function cascadedStepsFor(step: WorkflowStep): WorkflowStep[] {
+    const index = steps.findIndex((s) => s.id === step.id)
+    if (index === -1) return []
+    const result: WorkflowStep[] = []
+    for (let i = index + 1; i < steps.length; i++) {
+      if (steps[i].status === 'pending') break
+      result.push(steps[i])
+    }
+    return result
+  }
+
+  async function handleRevert() {
+    if (!onRevert || !revertTarget) return
+    setReverting(true)
+    setRevertError(null)
+    try {
+      await onRevert(revertTarget.id, requireRevertReason ? revertReason.trim() : undefined)
+      setRevertTarget(null)
+      setRevertReason('')
+    } catch (error) {
+      setRevertError(error instanceof Error ? error.message : 'Failed to revert')
+    } finally {
+      setReverting(false)
+    }
+  }
 
   return (
     <div className="space-y-6">
@@ -374,6 +504,8 @@ export function WorkflowTimeline({
         </div>
       </div>
 
+      {banner}
+
       {/* Timeline */}
       <ol className="relative space-y-4">
         {steps.map((step, i) => {
@@ -382,6 +514,7 @@ export function WorkflowTimeline({
           const isOpen = expanded === i
           const isLast = i === steps.length - 1
           const isNotifying = notifyingStepId === step.id
+          const canShowRevert = REVERT_ENABLED && canRevert && !!onRevert && step.status !== 'pending'
           return (
             <li key={step.id} className="relative">
               <div className="relative pl-14">
@@ -476,6 +609,20 @@ export function WorkflowTimeline({
                           {step.aiVerification ? 'Re-run AI Verification' : 'Run AI Verification'}
                         </button>
                       ) : null}
+                      {canManage && step.canGrantKbAccess && onGrantKbAccess ? (
+                        <button
+                          onClick={() => handleGrantKbAccess(step.id)}
+                          disabled={grantingStepId === step.id}
+                          className="inline-flex items-center gap-1.5 whitespace-nowrap rounded-xl bg-primary px-3 py-2 text-xs font-semibold text-primary-foreground shadow-soft transition-all duration-200 hover:-translate-y-0.5 hover:shadow-lift disabled:pointer-events-none disabled:opacity-60"
+                        >
+                          {grantingStepId === step.id ? (
+                            <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                          ) : (
+                            <KeyRound className="h-3.5 w-3.5" />
+                          )}
+                          Grant Access
+                        </button>
+                      ) : null}
                       {canManage && step.canGenerateHrProfile && onGenerateHrProfile ? (
                         <button
                           onClick={() => handleGenerateHrProfile(step.id)}
@@ -511,9 +658,13 @@ export function WorkflowTimeline({
                   {hrGenerateError?.stepId === step.id ? (
                     <p className="mt-2 text-xs font-medium text-destructive">{hrGenerateError.message}</p>
                   ) : null}
+                  {grantError?.stepId === step.id ? (
+                    <p className="mt-2 text-xs font-medium text-destructive">{grantError.message}</p>
+                  ) : null}
 
                   {step.documentChecklist ? (
                     <div className="mt-4 border-t border-border pt-4">
+                      {isOpen ? <StepOwnershipDetails step={step} /> : null}
                       <DocumentChecklist
                         items={step.documentChecklist}
                         canEdit={!!step.canUploadDocuments}
@@ -523,11 +674,15 @@ export function WorkflowTimeline({
                             : undefined
                         }
                       />
+                      {isOpen && canShowRevert ? (
+                        <RevertButton onClick={() => setRevertTarget(step)} />
+                      ) : null}
                     </div>
                   ) : null}
 
                   {isOpen && !step.documentChecklist ? (
                     <div className="mt-4 border-t border-border pt-4">
+                      <StepOwnershipDetails step={step} />
                       {step.hrProfileEntry ? (
                         <HrProfileEntryPanel entry={step.hrProfileEntry} />
                       ) : step.managerApprovalReport ? (
@@ -538,6 +693,17 @@ export function WorkflowTimeline({
                         <SimpleAiSummaryPanel summary={step.assetAllocationSummary} badgeLabel="Standard asset kit" />
                       ) : step.itVerificationSummary ? (
                         <SimpleAiSummaryPanel summary={step.itVerificationSummary} badgeLabel="IT sign-off confirmation" />
+                      ) : step.structuredReview ? (
+                        <div className="space-y-3">
+                          <AiReviewShortSummary
+                            summary={step.structuredReview.summary}
+                            review={step.structuredReview.review}
+                            badgeLabel={step.structuredReview.badgeLabel}
+                          />
+                          <StructuredReviewInfoRequest structuredReview={step.structuredReview} canManage={canManage} />
+                        </div>
+                      ) : step.departmentSummary ? (
+                        <SimpleAiSummaryPanel summary={step.departmentSummary.summary} badgeLabel={step.departmentSummary.badgeLabel} />
                       ) : step.aiVerification ? (
                         <AiVerificationPanel summary={step.aiVerification} />
                       ) : step.submittedDetails ? (
@@ -545,6 +711,7 @@ export function WorkflowTimeline({
                       ) : (
                         <p className="text-sm leading-relaxed text-muted-foreground">{step.details}</p>
                       )}
+                      {step.extraPanel ? <div className="mt-3">{step.extraPanel}</div> : null}
                       <div className="mt-3 flex items-center justify-between">
                         <span className="text-xs font-medium text-muted-foreground">
                           {step.meta}
@@ -557,6 +724,7 @@ export function WorkflowTimeline({
                           View Details
                         </button>
                       </div>
+                      {canShowRevert ? <RevertButton onClick={() => setRevertTarget(step)} /> : null}
                     </div>
                   ) : null}
 
@@ -642,7 +810,11 @@ export function WorkflowTimeline({
                 <span className="sr-only">Close</span>
               </button>
             </div>
-            {detailStep.aiVerification ? (
+            {detailStep.structuredReview ? (
+              <div className="mt-4">
+                <StructuredReviewFullLog url={detailStep.structuredReview.fullLogUrl} />
+              </div>
+            ) : detailStep.aiVerification ? (
               <div className="mt-4">
                 <AiVerificationPanel summary={detailStep.aiVerification} />
               </div>
@@ -738,6 +910,110 @@ export function WorkflowTimeline({
           </div>
         </div>
       ) : null}
+
+      {revertTarget ? (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+          <div className="absolute inset-0 bg-[#16233a]/40 backdrop-blur-sm" onClick={() => setRevertTarget(null)} aria-hidden />
+          <div
+            role="dialog"
+            aria-modal="true"
+            className="relative w-full max-w-sm space-y-4 rounded-3xl border border-border bg-card p-6 shadow-lift"
+          >
+            <h2 className="text-lg font-semibold text-foreground">Revert {revertTarget.title}?</h2>
+            <p className="text-sm leading-relaxed text-muted-foreground">
+              {(() => {
+                const cascaded = cascadedStepsFor(revertTarget)
+                return cascaded.length > 0
+                  ? `This will also reset: ${cascaded.map((s) => s.title).join(', ')}. Their data will be cleared.`
+                  : 'Its data will be cleared.'
+              })()}
+            </p>
+            {revertWarningFor?.(revertTarget) ? (
+              <p className="rounded-2xl bg-destructive/10 px-4 py-3 text-sm font-medium text-destructive">{revertWarningFor(revertTarget)}</p>
+            ) : null}
+            {requireRevertReason ? (
+              <textarea
+                value={revertReason}
+                onChange={(e) => setRevertReason(e.target.value)}
+                rows={3}
+                placeholder="Reason for reverting (required — recorded in the audit log and sent to everyone affected)"
+                className="w-full rounded-xl border border-border bg-background px-3 py-2 text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-primary/30"
+              />
+            ) : null}
+            {revertError ? <p className="text-xs font-medium text-destructive">{revertError}</p> : null}
+            <div className="flex items-center gap-3 pt-2">
+              <button
+                type="button"
+                onClick={() => setRevertTarget(null)}
+                className="flex-1 rounded-xl bg-secondary px-5 py-2.5 text-sm font-semibold text-foreground transition-colors hover:bg-secondary/70"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={handleRevert}
+                disabled={reverting || (requireRevertReason && !revertReason.trim())}
+                className="flex-1 rounded-xl bg-destructive px-5 py-2.5 text-sm font-semibold text-destructive-foreground shadow-soft transition-all duration-200 hover:-translate-y-0.5 hover:shadow-lift disabled:pointer-events-none disabled:opacity-60"
+              >
+                {reverting ? 'Reverting…' : 'Revert'}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+    </div>
+  )
+}
+
+/** "In charge" chip + Assigned/Completed by/Verified by lines — same block for every step, shown
+ * above the existing description/status content in the expanded panel. */
+function StepOwnershipDetails({ step }: { step: WorkflowStep }) {
+  if (!step.inCharge) return null
+  return (
+    <div className="mb-4 space-y-1.5 rounded-2xl bg-secondary/60 px-4 py-3">
+      <div className="flex items-center gap-2.5">
+        <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-accent text-[11px] font-semibold text-blue-ink">
+          {step.inCharge.initials}
+        </span>
+        <p className="text-sm text-foreground">
+          <span className="font-semibold">{step.inCharge.name}</span>{' '}
+          <span className="text-muted-foreground">— In charge · {step.inCharge.role}</span>
+        </p>
+      </div>
+      {step.assignedAt ? (
+        <p className="text-xs text-muted-foreground">
+          <span className="font-medium text-foreground">Assigned:</span> {formatWorkflowDateTime(step.assignedAt)}
+        </p>
+      ) : null}
+      {step.completedByPerson && step.completedAt ? (
+        <p className="text-xs text-muted-foreground">
+          <span className="font-medium text-foreground">Completed by:</span> {step.completedByPerson.name} (
+          {step.completedByPerson.role}) · {formatWorkflowDateTime(step.completedAt)}
+        </p>
+      ) : null}
+      {step.verifiedByPerson && step.verifiedAt ? (
+        <p className="text-xs text-muted-foreground">
+          <span className="font-medium text-foreground">Verified by:</span> {step.verifiedByPerson.name} (
+          {step.verifiedByPerson.role}) · {formatWorkflowDateTime(step.verifiedAt)}
+        </p>
+      ) : null}
+    </div>
+  )
+}
+
+/** Small red-outline button, bottom of the expanded panel — HR-only, dev-flag-gated, only on a
+ * step that's actually started (see canShowRevert). */
+function RevertButton({ onClick }: { onClick: () => void }) {
+  return (
+    <div className="mt-3 flex justify-end">
+      <button
+        type="button"
+        onClick={onClick}
+        className="inline-flex items-center gap-1.5 rounded-xl border border-destructive px-3 py-1.5 text-xs font-semibold text-destructive transition-colors hover:bg-destructive/10"
+      >
+        <Undo2 className="h-3.5 w-3.5" />
+        Revert
+      </button>
     </div>
   )
 }
@@ -1380,6 +1656,68 @@ function ItAccountCredentialsPanel({ report }: { report: ItAccountCredentialsSum
         {report.markdown}
       </pre>
     </div>
+  )
+}
+
+/** Under HR's short summary: where a "request info from employee" stands, or — whenever the run
+ * flags data the employee can provide (or Finance sent it back) and nothing is pending — the button
+ * to raise one. */
+function StructuredReviewInfoRequest({
+  structuredReview,
+  canManage,
+}: {
+  structuredReview: NonNullable<WorkflowStep['structuredReview']>
+  canManage: boolean
+}) {
+  const { mutate } = useSWRConfig()
+  const { infoRequest, review, workflowId, refreshKey, pendingSignature } = structuredReview
+  const openRequest = infoRequest?.status === 'open'
+  const canRequest =
+    canManage &&
+    !!workflowId &&
+    !!structuredReview.allowInfoRequest &&
+    !openRequest &&
+    canRequestFromRun({ missingData: structuredReview.summary.missingData, reviewAction: review?.action ?? null })
+  return (
+    <>
+      {pendingSignature ? (
+        <div className="rounded-2xl bg-accent px-4 py-3">
+          <p className="text-[11px] font-semibold uppercase tracking-wide text-blue-ink">Waiting on employee signature</p>
+          <p className="mt-1 text-sm text-foreground">
+            {pendingSignature.title} · issued {formatWorkflowDateTime(pendingSignature.issuedAt)}
+          </p>
+        </div>
+      ) : null}
+      {infoRequest ? <InfoRequestStatus request={infoRequest} /> : null}
+      {canRequest ? (
+        <RequestEmployeeInfoForm
+          workflowId={workflowId!}
+          missingData={structuredReview.summary.missingData}
+          onRequested={() => (refreshKey ? mutate(refreshKey) : undefined)}
+        />
+      ) : null}
+    </>
+  )
+}
+
+/** HR's View Details for a structured AI review: the same full log the department reviewed, read-only. */
+function StructuredReviewFullLog({ url }: { url: string }) {
+  const { user } = useAuth()
+  const { data, error, isLoading } = useSWR<{ latest: AiVerificationLog | null; review: AiReviewInfo | null; history: AiRunHistoryItem[] }>(
+    url,
+    authedFetcher(user?.email),
+  )
+  if (isLoading) return <p className="text-xs text-muted-foreground">Loading AI review…</p>
+  if (error) return <p className="text-xs font-medium text-destructive">{error.message}</p>
+  if (!data?.latest) return <p className="text-xs text-muted-foreground">No AI review has been run yet.</p>
+  return (
+    <AiReviewLog
+      log={data.latest}
+      history={data.history}
+      review={data.review}
+      readOnly
+      onOpenLink={(link) => openAuthedLink(link, user?.email)}
+    />
   )
 }
 

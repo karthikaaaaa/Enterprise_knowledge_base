@@ -12,13 +12,15 @@ import {
   Sparkles,
   Clock,
   ArrowUpRight,
+  Lock,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { type Department, type Document } from '@/lib/documents'
 import { DocIcon } from '@/components/knowledge/doc-icon'
 import { UploadModal } from '@/components/knowledge/upload-modal'
 import { useAuth } from '@/components/auth/auth-provider'
-import { canViewDocument, allowedDocumentDepartments } from '@/lib/document-access'
+import { canViewDocument, allowedDocumentDepartments, type KbAccess } from '@/lib/document-access'
+import { authedFetcher } from '@/lib/api-client'
 
 type View = 'grid' | 'list'
 
@@ -84,12 +86,19 @@ function DocCard({ doc, view }: { doc: Document; view: View }) {
   )
 }
 
-const fetcher = (url: string) => fetch(url).then((response) => response.json())
-
 export function KnowledgeBaseView() {
   const { user } = useAuth()
-  const { data, mutate } = useSWR('/api/documents', fetcher)
-  const libraryDocuments = ((data ?? []) as (Document & { pathname?: string; mimeType?: string; visibleDepartments?: Department[] })[]).filter((document) => canViewDocument(user, document))
+  // Keyed by email too, so switching demo logins in the same tab never flashes the previous
+  // user's (differently filtered) list from the SWR cache.
+  const { data, mutate } = useSWR(user ? ['/api/documents', user.email] : null, ([url]: [string, string]) =>
+    authedFetcher(user?.email)(url),
+  )
+  const { data: kbAccess } = useSWR<KbAccess>(user ? ['/api/knowledge-base/access', user.email] : null, ([url]: [string, string]) =>
+    authedFetcher(user?.email)(url),
+  )
+  const libraryDocuments = ((data ?? []) as (Document & { pathname?: string; mimeType?: string; visibleDepartments?: Department[] })[]).filter((document) => canViewDocument(user, document, kbAccess))
+  // An onboarding Employee before HR's Grant Access step — see lib/kb-access.ts.
+  const awaitingGrant = kbAccess?.restricted === true && kbAccess.categories.length === 0
   const [query, setQuery] = useState('')
   const [filter, setFilter] = useState<Department | 'All'>('All')
   const [view, setView] = useState<View>('grid')
@@ -97,8 +106,12 @@ export function KnowledgeBaseView() {
 
   // Section chips are scoped to what this role is allowed to browse by:
   // admin/hr see every department, employees only see All + Policies, everyone
-  // else sees All + their own department + Policies.
-  const visibleChips = useMemo<(Department | 'All')[]>(() => ['All', ...allowedDocumentDepartments(user)], [user])
+  // else sees All + their own department + Policies. An onboarding Employee gets exactly their
+  // granted categories instead (none at all before the grant).
+  const visibleChips = useMemo<(Department | 'All')[]>(
+    () => (awaitingGrant ? [] : ['All', ...allowedDocumentDepartments(user, kbAccess)]),
+    [user, kbAccess, awaitingGrant],
+  )
 
   useEffect(() => {
     if (!visibleChips.includes(filter)) setFilter('All')
@@ -115,6 +128,18 @@ export function KnowledgeBaseView() {
 
   const pinned = filtered.filter((d) => d.pinned)
   const recent = filtered
+
+  if (awaitingGrant) {
+    return (
+      <div className="rounded-3xl border border-dashed border-border bg-card p-12 text-center">
+        <Lock className="mx-auto h-8 w-8 text-muted-foreground" />
+        <p className="mt-3 text-sm font-medium text-foreground">No documents available yet</p>
+        <p className="mt-1 text-xs text-muted-foreground">
+          Your Knowledge Base access opens once HR grants it as part of your onboarding.
+        </p>
+      </div>
+    )
+  }
 
   return (
     <div className="space-y-6">

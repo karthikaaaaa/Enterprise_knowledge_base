@@ -10,6 +10,7 @@ const ERROR_STATUS: Record<TaskActionError, number> = {
   subtask_not_found: 404,
   approval_locked: 409,
   has_subtasks: 400,
+  not_adhoc: 400,
 }
 
 export async function PATCH(

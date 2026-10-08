@@ -15,6 +15,10 @@ export function formatWorkflowDate(iso: string) {
   return new Date(iso).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })
 }
 
+export function formatWorkflowDateTime(iso: string) {
+  return new Date(iso).toLocaleString('en-US', { month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit' })
+}
+
 export function formatRelativeTime(iso: string) {
   const diffSec = Math.max(0, Math.round((Date.now() - new Date(iso).getTime()) / 1000))
   if (diffSec < 60) return 'just now'

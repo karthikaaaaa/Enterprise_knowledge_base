@@ -10,6 +10,7 @@ const ERROR_STATUS: Record<TaskActionError, number> = {
   subtask_not_found: 404,
   approval_locked: 409,
   has_subtasks: 400,
+  not_adhoc: 400,
 }
 
 /** Fallback for ad-hoc tasks with no subtasks — a direct "Mark Complete" toggle. Tasks with subtasks must go through the subtask endpoint. */
@@ -37,7 +38,7 @@ export async function PATCH(request: Request, { params }: { params: Promise<{ ap
     return NextResponse.json({ error: "status must be 'completed' or 'allocated'" }, { status: 400 })
   }
 
-  const result = setApprovalStatusDirect(approvalId, status)
+  const result = setApprovalStatusDirect(approvalId, status, caller.user.id)
   if (!result.ok) {
     return NextResponse.json({ error: result.error }, { status: ERROR_STATUS[result.error] })
   }

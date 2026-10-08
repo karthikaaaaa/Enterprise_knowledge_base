@@ -13,7 +13,7 @@ export async function PATCH(request: Request, { params }: { params: Promise<{ id
   if (!notification) {
     return NextResponse.json({ error: 'Notification not found' }, { status: 404 })
   }
-  if (notification.roleId !== caller.role.id) {
+  if (notification.roleId !== caller.role.id || (notification.recipientUserId && notification.recipientUserId !== caller.user.id)) {
     return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
   }
 

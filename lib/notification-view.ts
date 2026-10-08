@@ -45,7 +45,7 @@ function describeNotification(notification: Notification): NotificationItem {
   }
 }
 
-/** Most recent notifications for a role — notifications are role-scoped (role_id FK from Step 1), not per-user, so every login sharing a role sees the same list. */
-export function listNotificationsForRole(roleId: string): NotificationItem[] {
-  return listNotificationsByRole(roleId).slice(0, LIST_LIMIT).map(describeNotification)
+/** Most recent notifications for a role — notifications are role-scoped (role_id FK from Step 1), not per-user, so every login sharing a role sees the same list — plus any addressed to this user only (recipient_user_id). */
+export function listNotificationsForRole(roleId: string, userId: string | null = null): NotificationItem[] {
+  return listNotificationsByRole(roleId, userId).slice(0, LIST_LIMIT).map(describeNotification)
 }

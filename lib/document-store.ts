@@ -18,6 +18,9 @@ export type StoredDocument = {
   department: Department
   access: string
   uploadedBy: string
+  /** Current owner, when ownership has been handed over (offboarding knowledge transfer). Absent
+   * on older records — the uploader is the owner then (see documentOwner). */
+  owner?: string
   createdAt: string
   processingStatus: ProcessingStatus
   /** Which department sections this document should appear under, besides "All". */
@@ -96,6 +99,21 @@ export async function renameDocument(id: string, newName: string) {
   return all[index]
 }
 
+/** Who owns a document right now: an explicit owner if one was assigned, else the uploader. */
+export function documentOwner(record: Pick<StoredDocument, 'owner' | 'uploadedBy'>) {
+  return record.owner ?? record.uploadedBy
+}
+
+/** Reassigns a document's owner (knowledge transfer) — reversible: pass the previous owner back. */
+export async function setDocumentOwner(id: string, owner: string) {
+  const all = await readAll()
+  const index = all.findIndex((doc) => doc.id === id)
+  if (index === -1) return null
+  all[index] = { ...all[index], owner }
+  await writeAll(all)
+  return all[index]
+}
+
 export async function updateProcessingStatus(id: string, status: ProcessingStatus) {
   const all = await readAll()
   const index = all.findIndex((doc) => doc.id === id)
@@ -137,7 +155,7 @@ export function mapToApiDocument(record: StoredDocument) {
     // Existing records saved before this field existed won't have it on disk; derive it the same way.
     visibleDepartments: record.visibleDepartments ?? computeVisibleDepartments(record.department, record.access),
     pages: 1,
-    owner: record.uploadedBy,
+    owner: documentOwner(record),
     pinned: false,
     indexed: record.processingStatus === 'processed',
     summary: 'Newly uploaded document. AI indexing will be available after processing.',

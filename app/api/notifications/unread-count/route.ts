@@ -8,5 +8,5 @@ export async function GET(request: Request) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   }
 
-  return NextResponse.json({ count: countUnreadNotifications(caller.role.id) })
+  return NextResponse.json({ count: countUnreadNotifications(caller.role.id, caller.user.id) })
 }

@@ -25,7 +25,7 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
     return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
   }
 
-  const result = resetLastVerifiedStep(id)
+  const result = await resetLastVerifiedStep(id)
   if (!result.ok) {
     const status = result.error === 'nothing_to_reset' ? 400 : 404
     const message = result.error === 'nothing_to_reset' ? 'No completed step to reset yet' : 'Workflow not found'

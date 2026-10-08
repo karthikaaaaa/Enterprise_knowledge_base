@@ -12,7 +12,8 @@ export function getCaller(request: Request): Caller | null {
   const email = request.headers.get('x-user-email')
   if (!email) return null
   const user = getUserByEmail(email)
-  if (!user) return null
+  // Deactivated accounts (e.g. an employee whose offboarding is complete) get no access anywhere.
+  if (!user || !user.isActive) return null
   const role = getRoleById(user.roleId)
   if (!role) return null
   const employee = getEmployeeByUserId(user.id)

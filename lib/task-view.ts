@@ -19,6 +19,8 @@ const TASK_STATUSES = new Set(['allocated', 'in_progress', 'completed'])
 export type TaskItem = {
   approvalId: string
   workflowId: string
+  /** 'onboarding' | 'offboarding' — the Tasks page labels offboarding tasks. */
+  workflowType: string
   stepId: string
   stepName: string
   stepTitle: string
@@ -60,6 +62,7 @@ export function listTasksForRole(roleName: string): TaskItem[] {
       tasks.push({
         approvalId: approval.id,
         workflowId: workflow.id,
+        workflowType: workflow.type,
         stepId: step.id,
         stepName: step.stepName,
         stepTitle: humanizeStepName(step.stepName),

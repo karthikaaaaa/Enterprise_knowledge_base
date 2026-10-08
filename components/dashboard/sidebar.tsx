@@ -20,8 +20,15 @@ const nav: { label: string; icon: typeof LayoutDashboard; href: string; roles?: 
 
 export function Sidebar() {
   const pathname = usePathname()
-  const { user, logout } = useAuth()
-  const visibleNav = nav.filter((item) => !item.roles || (user && item.roles.includes(user.role)))
+  const { user, logout, accountStatus } = useAuth()
+  // An employee being offboarded only keeps their offboarding page, the Knowledge Base (already
+  // narrowed server-side) and AI Chat (same KB access) — the API enforces the rest.
+  const EXITING_NAV = new Set(['/automation', '/knowledge-base', '/ai-chat'])
+  const visibleNav = nav.filter(
+    (item) =>
+      (!item.roles || (user && item.roles.includes(user.role))) &&
+      (accountStatus?.offboarding !== 'exiting' || EXITING_NAV.has(item.href)),
+  )
 
   // HR/Administrator only: how many workflows have at least one department-completed step awaiting their sign-off.
   const canSeeVerificationBadge = user?.role === 'admin' || user?.role === 'hr'

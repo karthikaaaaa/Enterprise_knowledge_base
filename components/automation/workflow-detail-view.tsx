@@ -1,6 +1,6 @@
 'use client'
 
-import useSWR from 'swr'
+import useSWR, { useSWRConfig } from 'swr'
 import { useAuth } from '@/components/auth/auth-provider'
 import { authedFetcher, authedPost, ApiError } from '@/lib/api-client'
 import {
@@ -20,6 +20,24 @@ import {
 import type { WorkflowDetail, WorkflowStepDetail } from '@/lib/workflow-view'
 import type { EmployeeDetailSubmission, EmployeeDocument } from '@/lib/workflow-store'
 import { humanizeStepName, formatWorkflowDate as formatDate } from '@/lib/workflow-format'
+import type { AiLogHrSummary } from '@/lib/ai-verification-log'
+import type { AiReviewInfo } from '@/components/verification/ai-review-log'
+import { EmployeeInfoRequestCard, type InfoRequestSummary } from '@/components/verification/info-request'
+import { EmployeeAgreementSignCard } from '@/components/verification/legal-record-panels'
+import { useState } from 'react'
+import {
+  ManagerPickerDialog,
+  OffboardingEmployeeCard,
+  OffboardingHrStepPanel,
+  useOffboardingState,
+} from '@/components/offboarding/offboarding-panels'
+
+type ApiStructuredReviewSummary = {
+  latest: AiLogHrSummary | null
+  review: AiReviewInfo | null
+  infoRequest?: InfoRequestSummary | null
+  pendingSignature?: { title: string; issuedAt: string } | null
+}
 
 // Manager approval now runs through the same Notify → Tasks → HR-verify flow as IT/Finance/Legal
 // (see DEPARTMENT_FIXED below), so it's no longer HR-owned — only hr_approval itself stays here.
@@ -35,6 +53,9 @@ const MANAGER_APPROVAL_STEP = 'manager_approval'
 const IT_ACCOUNT_CREATION_STEP = 'it_account_creation'
 const ASSET_ALLOCATION_STEP = 'asset_allocation'
 const IT_VERIFICATION_STEP = 'it_verification'
+const FINANCE_VERIFICATION_STEP = 'finance_verification'
+const LEGAL_VERIFICATION_STEP = 'legal_verification'
+const KNOWLEDGE_BASE_ACCESS_STEP = 'knowledge_base_access'
 
 // Mirrors REQUIRED_DOCUMENT_TYPES in lib/workflow-actions.ts. Duplicated here because that module
 // pulls in the sqlite-backed store and can't be imported into a client component — keep the type,
@@ -218,6 +239,14 @@ function toTimelineStep(
     itAccountCredentials: ApiItAccountReport | null
     assetAllocationSummary: ApiSimpleSummary | null
     itVerificationSummary: ApiSimpleSummary | null
+    financeVerificationSummary: ApiSimpleSummary | null
+    legalVerificationSummary: ApiSimpleSummary | null
+    legalVerified: boolean
+    /** HR/Administrator only (null for everyone else): finance_verification's structured review summary. */
+    financeStructuredReview?: ApiStructuredReviewSummary | null
+    /** HR/Administrator only: legal_verification's structured review summary. */
+    legalStructuredReview?: ApiStructuredReviewSummary | null
+    workflowId?: string
   },
 ): WorkflowStep {
   const approval = step.approval
@@ -232,6 +261,38 @@ function toTimelineStep(
   const isItAccountCreationStep = step.stepName === IT_ACCOUNT_CREATION_STEP
   const isAssetAllocationStep = step.stepName === ASSET_ALLOCATION_STEP
   const isItVerificationStep = step.stepName === IT_VERIFICATION_STEP
+  const isKnowledgeBaseAccessStep = step.stepName === KNOWLEDGE_BASE_ACCESS_STEP
+  const structuredReview =
+    step.stepName === FINANCE_VERIFICATION_STEP && ctx.financeStructuredReview?.latest && ctx.workflowId
+      ? {
+          summary: ctx.financeStructuredReview.latest,
+          review: ctx.financeStructuredReview.review,
+          badgeLabel: 'Finance pre-check',
+          fullLogUrl: `/api/workflows/${ctx.workflowId}/steps/finance_verification/runs?view=full`,
+          infoRequest: ctx.financeStructuredReview.infoRequest ?? null,
+          allowInfoRequest: true,
+          workflowId: ctx.workflowId,
+          refreshKey: `/api/workflows/${ctx.workflowId}/steps/finance_verification/runs`,
+        }
+      : step.stepName === LEGAL_VERIFICATION_STEP && ctx.legalStructuredReview?.latest && ctx.workflowId
+        ? {
+            summary: ctx.legalStructuredReview.latest,
+            review: ctx.legalStructuredReview.review,
+            badgeLabel: 'Legal pre-check',
+            fullLogUrl: `/api/workflows/${ctx.workflowId}/steps/legal_verification/runs?view=full`,
+            pendingSignature: ctx.legalStructuredReview.pendingSignature ?? null,
+            workflowId: ctx.workflowId,
+            refreshKey: `/api/workflows/${ctx.workflowId}/steps/legal_verification/runs`,
+          }
+        : null
+  const departmentSummary =
+    structuredReview
+      ? null
+      : step.stepName === FINANCE_VERIFICATION_STEP && ctx.financeVerificationSummary
+      ? { summary: ctx.financeVerificationSummary, badgeLabel: 'Finance pre-check' }
+      : step.stepName === LEGAL_VERIFICATION_STEP && ctx.legalVerificationSummary
+        ? { summary: ctx.legalVerificationSummary, badgeLabel: 'Legal pre-check' }
+        : null
 
   const meta =
     status === 'completed'
@@ -246,7 +307,9 @@ function toTimelineStep(
             // Never say "Completed" here — the step isn't done until HR clicks Verify, and
             // statusText's generic wording for HR-owned steps says exactly that word.
             ? 'AI profile generated — awaiting HR verification'
-            : statusText(approval?.status, step.departmentName)
+            : isKnowledgeBaseAccessStep && !approval
+              ? 'Ready — grant Knowledge Base access to finish onboarding'
+              : statusText(approval?.status, step.departmentName)
 
   return {
     id: step.id,
@@ -316,6 +379,19 @@ function toTimelineStep(
     // Same display-only treatment — only ever non-null once it_account_creation AND
     // asset_allocation are both verified (see maybeGenerateItVerificationSummary).
     itVerificationSummary: isItVerificationStep && ctx.itVerificationSummary ? ctx.itVerificationSummary : null,
+    // Display-only — Fatima/Lucas review it and click their own Verify on their Tasks page; HR's
+    // Verify here (canVerify above) is the separate, second sign-off.
+    departmentSummary,
+    structuredReview,
+    // Not a department task, so no Notify — HR grants it directly, which verifies the step in one
+    // go. Hidden until legal_verification is verified (the server enforces the same rule).
+    canGrantKbAccess: isKnowledgeBaseAccessStep && ctx.canManage && !step.locked && !approval && ctx.legalVerified,
+    inCharge: step.inCharge,
+    assignedAt: step.assignedAt,
+    completedByPerson: step.completedBy,
+    completedAt: step.completedAt,
+    verifiedByPerson: step.verifiedBy,
+    verifiedAt: step.verifiedAt,
   }
 }
 
@@ -326,6 +402,16 @@ export function WorkflowDetailView({ workflowId }: { workflowId: string }) {
 
   const canManage = !!user && CAN_MANAGE_ROLES.has(user.role)
   const isEmployeeViewer = user?.role === 'employee'
+  // Revert is HR-only — never Administrator, Manager, or a department login (see the /revert route).
+  const canRevert = user?.role === 'hr'
+
+  // ---- Offboarding (lib/offboarding/*) — inert for onboarding workflows. ----
+  const isOffboarding = data?.type === 'offboarding'
+  const { data: offboardingState } = useOffboardingState(workflowId, isOffboarding && (canManage || isEmployeeViewer))
+  const [managerPickerOpen, setManagerPickerOpen] = useState(false)
+  const { mutate: mutateGlobal } = useSWRConfig()
+  /** Offboarding actions touch several data sources at once (workflow, state, runs) — refresh all. */
+  const refreshAllForWorkflow = () => mutateGlobal((key) => typeof key === 'string' && key.startsWith(`/api/workflows/${workflowId}`))
 
   const employeeDetailsStatus = data?.steps.find((s) => s.stepName === EMPLOYEE_DETAILS_STEP)?.approval?.status
   const canSeeSubmission = isEmployeeViewer || canManage
@@ -413,7 +499,77 @@ export function WorkflowDetailView({ workflowId }: { workflowId: string }) {
     authedFetcher(user?.email),
   )
 
+  // Same shared visibility as asset_allocation/it_verification's summaries above.
+  const financeVerificationStepStatus = data?.steps.find((s) => s.stepName === FINANCE_VERIFICATION_STEP)?.approval?.status
+  const financeVerificationSummaryKey =
+    (canManage || isEmployeeViewer) && (financeVerificationStepStatus === 'completed' || financeVerificationStepStatus === 'verified')
+      ? `/api/workflows/${workflowId}/steps/finance_verification/summary`
+      : null
+  const { data: financeVerificationSummaryData, mutate: mutateFinanceVerificationSummary } = useSWR<{
+    summary: ApiSimpleSummary
+  }>(financeVerificationSummaryKey, authedFetcher(user?.email))
+
+  // HR/Administrator's short view of finance_verification's structured AI review — fetched as soon
+  // as Finance has been notified (the run exists from then on), not just once completed. The
+  // employee never gets this; their view keeps the plain /summary above.
+  const financeStructuredReviewKey =
+    canManage && financeVerificationStepStatus ? `/api/workflows/${workflowId}/steps/finance_verification/runs` : null
+  const { data: financeStructuredReviewData, mutate: mutateFinanceStructuredReview } = useSWR<ApiStructuredReviewSummary>(
+    financeStructuredReviewKey,
+    authedFetcher(user?.email),
+  )
+
+  const legalVerificationStepStatus = data?.steps.find((s) => s.stepName === LEGAL_VERIFICATION_STEP)?.approval?.status
+  const legalVerificationSummaryKey =
+    (canManage || isEmployeeViewer) && (legalVerificationStepStatus === 'completed' || legalVerificationStepStatus === 'verified')
+      ? `/api/workflows/${workflowId}/steps/legal_verification/summary`
+      : null
+  const { data: legalVerificationSummaryData, mutate: mutateLegalVerificationSummary } = useSWR<{
+    summary: ApiSimpleSummary
+  }>(legalVerificationSummaryKey, authedFetcher(user?.email))
+
+  // Same as finance's structured review above, for legal_verification.
+  const legalStructuredReviewKey =
+    canManage && legalVerificationStepStatus ? `/api/workflows/${workflowId}/steps/legal_verification/runs` : null
+  const { data: legalStructuredReviewData, mutate: mutateLegalStructuredReview } = useSWR<ApiStructuredReviewSummary>(
+    legalStructuredReviewKey,
+    authedFetcher(user?.email),
+  )
+
+  /** Every derived data source a reset/revert can clear. Passing `undefined` drops the cached value
+   * outright (then revalidates if the key is still active) — a plain revalidate would 404 on a
+   * now-deleted record and SWR would keep showing the stale copy from before the revert. */
+  function clearDerivedData() {
+    return Promise.all([
+      mutate(),
+      mutateSubmission(undefined),
+      mutateDocuments(undefined),
+      mutateAiResult(undefined),
+      mutateHrProfileEntry(undefined),
+      mutateManagerApprovalReport(undefined),
+      mutateItAccountCredentials(undefined),
+      mutateAssetAllocationSummary(undefined),
+      mutateItVerificationSummary(undefined),
+      mutateFinanceVerificationSummary(undefined),
+      mutateFinanceStructuredReview(undefined),
+      mutateLegalStructuredReview(undefined),
+      mutateLegalVerificationSummary(undefined),
+    ])
+  }
+
   async function handleNotify(stepId: string) {
+    if (isOffboarding) {
+      // Offboarding steps have their own Notify (manager resolution, AI automation) — see
+      // lib/offboarding/actions.ts. No reporting manager yet → HR picks one first.
+      const stepName = data?.steps.find((s) => s.id === stepId)?.stepName ?? ''
+      if (stepName === 'manager_exit_approval' && !offboardingState?.manager) {
+        setManagerPickerOpen(true)
+        return
+      }
+      await authedPost(`/api/workflows/${workflowId}/offboarding/notify`, user?.email, { step_key: stepName })
+      await refreshAllForWorkflow()
+      return
+    }
     await authedPost<{ step: WorkflowStepDetail }>(`/api/workflows/${workflowId}/steps/${stepId}/notify`, user?.email)
     // Refetch rather than patch just this step: notifying doesn't change any other step's lock
     // state, but keeping one code path for both actions avoids the two drifting apart later.
@@ -487,20 +643,24 @@ export function WorkflowDetailView({ workflowId }: { workflowId: string }) {
 
   async function handleResetLastStep() {
     await authedPost(`/api/workflows/${workflowId}/dev-reset-last-step`, user?.email)
-    // The reset can touch several derived data sources (submission, documents, AI result, HR
-    // profile entry, manager approval report, IT credentials, asset/IT-verification summaries)
-    // depending on which step it undid, so refetch everything rather than guess.
-    await Promise.all([
-      mutate(),
-      mutateSubmission(),
-      mutateDocuments(),
-      mutateAiResult(),
-      mutateHrProfileEntry(),
-      mutateManagerApprovalReport(),
-      mutateItAccountCredentials(),
-      mutateAssetAllocationSummary(),
-      mutateItVerificationSummary(),
-    ])
+    // The reset can touch several derived data sources depending on which step it undid, so clear
+    // and refetch everything rather than guess.
+    await clearDerivedData()
+  }
+
+  async function handleRevert(stepId: string, reason?: string) {
+    await authedPost(`/api/workflows/${workflowId}/steps/${stepId}/revert`, user?.email, reason ? { reason } : undefined)
+    if (isOffboarding) await refreshAllForWorkflow()
+    // A revert can cascade through several steps and clear any of their derived data sources —
+    // same "clear everything" reasoning as handleResetLastStep above.
+    await clearDerivedData()
+  }
+
+  async function handleGrantKbAccess(_stepId: string) {
+    await authedPost(`/api/workflows/${workflowId}/steps/knowledge_base_access/grant`, user?.email)
+    // Granting verifies this step and may also close out the 'completed' marker step and the
+    // workflow itself, so refetch the whole list.
+    await mutate()
   }
 
   if (isLoading) {
@@ -520,16 +680,37 @@ export function WorkflowDetailView({ workflowId }: { workflowId: string }) {
 
   if (!data) return null
 
+  const offboardingStepPanel = (step: WorkflowStepDetail) =>
+    isOffboarding && canManage && offboardingState ? (
+      <OffboardingHrStepPanel
+        workflowId={workflowId}
+        stepKey={step.stepName}
+        state={offboardingState}
+        approvalStatus={step.approval?.status ?? null}
+        locked={step.locked}
+      />
+    ) : undefined
+
   return (
+    <>
     <WorkflowTimeline
       employee={{
         name: data.employee.name,
         role: data.employee.role,
         date: formatDate(data.createdAt),
-        label: data.type === 'onboarding' ? 'New Hire' : 'Exiting',
+        // An offboarding only counts once Exit Initiated is started — reverting it puts the employee
+        // back to Active (same rule as lib/offboarding/access.ts).
+        label:
+          data.type === 'onboarding'
+            ? 'New Hire'
+            : data.status === 'completed'
+              ? 'Exited'
+              : data.steps.find((s) => s.stepName === 'exit_initiated')?.approval
+                ? 'Exiting'
+                : 'Active',
       }}
-      steps={data.steps.map((step) =>
-        toTimelineStep(step, {
+      steps={data.steps.map((step) => ({
+        ...toTimelineStep(step, {
           isEmployeeViewer,
           canManage,
           employeeDepartment: data.employee.department,
@@ -542,8 +723,18 @@ export function WorkflowDetailView({ workflowId }: { workflowId: string }) {
           itAccountCredentials: itAccountCredentialsData?.report ?? null,
           assetAllocationSummary: assetAllocationSummaryData?.summary ?? null,
           itVerificationSummary: itVerificationSummaryData?.summary ?? null,
+          financeVerificationSummary: financeVerificationSummaryData?.summary ?? null,
+          legalVerificationSummary: legalVerificationSummaryData?.summary ?? null,
+          legalVerified: data.steps.find((s) => s.stepName === LEGAL_VERIFICATION_STEP)?.approval?.status === 'verified',
+          financeStructuredReview: financeStructuredReviewData ?? null,
+          legalStructuredReview: legalStructuredReviewData ?? null,
+          workflowId,
         }),
-      )}
+        extraPanel: offboardingStepPanel(step),
+        ...(isOffboarding && step.stepName === 'hr_exit_approval' && offboardingState?.viewer === 'hr' && (offboardingState.exitDetailsRequest as { status?: string } | null | undefined)?.status === 'open'
+          ? { subLabel: 'Awaiting employee details' }
+          : {}),
+      }))}
       canManage={canManage}
       onNotify={canManage ? handleNotify : undefined}
       onAddAdhocStep={canManage ? handleAddAdhocStep : undefined}
@@ -553,6 +744,40 @@ export function WorkflowDetailView({ workflowId }: { workflowId: string }) {
       onRunAiVerification={canManage ? handleRunAiVerification : undefined}
       onGenerateHrProfile={canManage ? handleGenerateHrProfile : undefined}
       onResetLastStep={isEmployeeViewer ? handleResetLastStep : undefined}
+      canRevert={canRevert}
+      // Only renders when HR has an open "request info" waiting on this employee.
+      banner={
+        isEmployeeViewer ? (
+          <>
+            <EmployeeInfoRequestCard workflowId={workflowId} />
+            <EmployeeAgreementSignCard workflowId={workflowId} />
+            {isOffboarding ? <OffboardingEmployeeCard workflowId={workflowId} /> : null}
+          </>
+        ) : undefined
+      }
+      onRevert={canRevert ? handleRevert : undefined}
+      requireRevertReason={isOffboarding}
+      revertWarningFor={(step) =>
+        isOffboarding && step.stepName === 'exit_initiated'
+          ? `This reverts the whole offboarding: every later step goes back to Pending, access, Knowledge Base permissions, payroll/reimbursement records and ownership transfers are restored, the exit details are cleared, and ${data.employee.name} becomes Active again. Their manager and any department with a pending task are notified.`
+          : null
+      }
+      onGrantKbAccess={canManage ? handleGrantKbAccess : undefined}
     />
+    {managerPickerOpen && offboardingState ? (
+      <ManagerPickerDialog
+        candidates={offboardingState.managerCandidates ?? []}
+        onCancel={() => setManagerPickerOpen(false)}
+        onPick={async (managerUserId) => {
+          await authedPost(`/api/workflows/${workflowId}/offboarding/notify`, user?.email, {
+            step_key: 'manager_exit_approval',
+            manager_user_id: managerUserId,
+          })
+          setManagerPickerOpen(false)
+          await refreshAllForWorkflow()
+        }}
+      />
+    ) : null}
+    </>
   )
 }

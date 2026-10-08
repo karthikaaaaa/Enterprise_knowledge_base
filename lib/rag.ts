@@ -4,7 +4,7 @@ import { extractText } from '@/lib/text-extraction'
 import { chunkText } from '@/lib/chunking'
 import { embedText, embedTexts } from '@/lib/embeddings'
 import { replaceChunksForDocument, deleteChunksForDocument, getIndexedDocumentIds, searchSimilarChunks } from '@/lib/chunk-store'
-import { listDocuments, updateProcessingStatus, type StoredDocument } from '@/lib/document-store'
+import { listDocuments, getDocumentById, updateProcessingStatus, type StoredDocument } from '@/lib/document-store'
 
 /** Extracts, chunks, and embeds one document, then stores the result. Best-effort — never throws. */
 export async function indexDocument(record: StoredDocument) {
@@ -20,6 +20,10 @@ export async function indexDocument(record: StoredDocument) {
 
     const chunks = chunkText(text)
     const embeddings = await embedTexts(chunks.map((c) => c.text))
+    // Indexing runs fire-and-forget after upload/KB-entry creation, so the document may have been
+    // deleted (e.g. a workflow Revert retracting an hr_approval profile) while embeddings were
+    // being computed — don't resurrect orphaned chunks for it.
+    if (!(await getDocumentById(record.id))) return
     await replaceChunksForDocument(
       record.id,
       chunks.map((c, i) => ({ chunkIndex: c.index, text: c.text, embedding: embeddings[i] })),
@@ -50,11 +54,13 @@ const SYSTEM_PROMPT =
 // matches score ~0.45-0.55, unrelated ones ~0.02-0.05 with the MiniLM embedding model).
 const MIN_RELEVANCE_SCORE = 0.3
 
-export async function answerQuestion(question: string): Promise<ChatAnswer> {
+/** `allowedDocumentIds` scopes retrieval to the documents the caller is allowed to see (see the
+ * chat route) — omitted means the whole library, as before. */
+export async function answerQuestion(question: string, allowedDocumentIds?: Set<string>): Promise<ChatAnswer> {
   await ensureAllDocumentsIndexed()
 
   const queryEmbedding = await embedText(question)
-  const ranked = await searchSimilarChunks(queryEmbedding, 5)
+  const ranked = await searchSimilarChunks(queryEmbedding, 5, allowedDocumentIds)
   const matches = ranked.filter((m) => m.score >= MIN_RELEVANCE_SCORE)
 
   if (matches.length === 0) {

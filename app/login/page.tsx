@@ -13,9 +13,16 @@ export default function LoginPage() {
   const [showPassword, setShowPassword] = useState(false)
   const [error, setError] = useState('')
 
-  function submit(event: React.FormEvent<HTMLFormElement>) {
+  async function submit(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault()
-    setError(login(email, password) ? '' : 'That email and password combination is not valid.')
+    const result = await login(email, password)
+    setError(
+      result === 'ok'
+        ? ''
+        : result === 'deactivated'
+          ? 'This account has been deactivated. Contact HR if you think this is a mistake.'
+          : 'That email and password combination is not valid.',
+    )
   }
 
   function choose(user: typeof DEMO_USERS[number]) {

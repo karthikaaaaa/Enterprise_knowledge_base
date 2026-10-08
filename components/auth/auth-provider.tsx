@@ -30,12 +30,36 @@ export const DEMO_USERS: DemoUser[] = [
   { id: 'mei', name: 'Mei Tanaka', email: 'mei@knowledgeos.demo', password: 'Employee123!', role: 'employee', department: 'Sales', title: 'Sales Manager' },
 ]
 
-type AuthContextValue = { user: DemoUser | null; loading: boolean; login: (email: string, password: string) => boolean; logout: () => void; can: (roles: Role[]) => boolean }
+export type LoginResult = 'ok' | 'invalid' | 'deactivated'
+/** Server-side account state: deactivated accounts can't sign in; 'exiting' employees get the
+ * restricted offboarding navigation. */
+export type AccountStatus = { active: boolean; offboarding: 'exiting' | 'exited' | null }
+
+type AuthContextValue = {
+  user: DemoUser | null
+  loading: boolean
+  login: (email: string, password: string) => Promise<LoginResult>
+  logout: () => void
+  can: (roles: Role[]) => boolean
+  accountStatus: AccountStatus | null
+}
+
+async function fetchAccountStatus(email: string): Promise<AccountStatus | null> {
+  try {
+    const response = await fetch('/api/auth/status', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ email }) })
+    if (!response.ok) return null
+    const body = (await response.json()) as { exists: boolean; active: boolean; offboarding: AccountStatus['offboarding'] }
+    return body.exists ? { active: body.active, offboarding: body.offboarding } : null
+  } catch {
+    return null
+  }
+}
 const AuthContext = createContext<AuthContextValue | null>(null)
 
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<DemoUser | null>(null)
   const [loading, setLoading] = useState(true)
+  const [accountStatus, setAccountStatus] = useState<AccountStatus | null>(null)
   const router = useRouter()
   const pathname = usePathname()
 
@@ -49,16 +73,42 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     if (!loading && !user && pathname !== '/login') router.replace('/login')
   }, [loading, pathname, router, user])
 
+  // Re-check the account on every page change: an account deactivated mid-session (exit completed)
+  // is signed out, and an exiting employee is kept to their offboarding pages.
+  useEffect(() => {
+    if (!user) {
+      setAccountStatus(null)
+      return
+    }
+    let cancelled = false
+    void fetchAccountStatus(user.email).then((status) => {
+      if (cancelled) return
+      setAccountStatus(status)
+      if (status && !status.active) {
+        window.sessionStorage.removeItem('knowledgeos-demo-user')
+        setUser(null)
+        router.replace('/login')
+      } else if (status?.offboarding === 'exiting' && (pathname === '/' || pathname.startsWith('/settings'))) {
+        router.replace('/automation')
+      }
+    })
+    return () => {
+      cancelled = true
+    }
+  }, [user, pathname, router])
+
   const value = useMemo<AuthContextValue>(() => ({
     user,
     loading,
-    login: (email, password) => {
+    login: async (email, password) => {
       const match = DEMO_USERS.find((candidate) => candidate.email.toLowerCase() === email.trim().toLowerCase() && candidate.password === password)
-      if (!match) return false
+      if (!match) return 'invalid'
+      const status = await fetchAccountStatus(match.email)
+      if (status && !status.active) return 'deactivated'
       window.sessionStorage.setItem('knowledgeos-demo-user', match.id)
       setUser(match)
-      router.replace('/')
-      return true
+      router.replace(status?.offboarding === 'exiting' ? '/automation' : '/')
+      return 'ok'
     },
     logout: () => {
       window.sessionStorage.removeItem('knowledgeos-demo-user')
@@ -66,7 +116,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       router.replace('/login')
     },
     can: (roles) => !!user && roles.includes(user.role),
-  }), [loading, router, user])
+    accountStatus,
+  }), [accountStatus, loading, router, user])
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>
 }

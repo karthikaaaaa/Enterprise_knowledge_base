@@ -18,6 +18,8 @@ const ERROR_STATUS: Record<WorkflowActionError, number> = {
   already_verified: 409,
   step_locked: 409,
   already_submitted: 409,
+  precondition_not_met: 400,
+  already_granted: 409,
 }
 
 const ERROR_MESSAGE: Record<WorkflowActionError, string> = {
@@ -31,6 +33,8 @@ const ERROR_MESSAGE: Record<WorkflowActionError, string> = {
   already_verified: 'This step has already been verified',
   step_locked: 'Complete and verify the previous step before starting this one',
   already_submitted: 'Documents have already been verified and can no longer be edited',
+  precondition_not_met: 'Legal Verification must be verified before Knowledge Base access can be granted',
+  already_granted: 'Knowledge Base access has already been granted',
 }
 
 export async function POST(request: Request, { params }: { params: Promise<{ id: string }> }) {

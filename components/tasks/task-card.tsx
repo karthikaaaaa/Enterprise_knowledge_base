@@ -1,18 +1,43 @@
 'use client'
 
 import { useState, type ReactNode } from 'react'
-import useSWR from 'swr'
+import useSWR, { useSWRConfig } from 'swr'
 import { ChevronDown, Loader2, Sparkles, ShieldCheck, Check } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { useAuth } from '@/components/auth/auth-provider'
 import { authedFetcher, authedPatch, authedPost } from '@/lib/api-client'
 import type { TaskItem } from '@/lib/task-view'
 import type { Subtask } from '@/lib/workflow-store'
+import type { AiVerificationLog } from '@/lib/ai-verification-log'
+import {
+  AiReviewDecision,
+  AiReviewLog,
+  openAuthedLink,
+  type AiReviewInfo,
+  type AiRunHistoryItem,
+} from '@/components/verification/ai-review-log'
+import { InfoRequestStatus, type InfoRequestSummary } from '@/components/verification/info-request'
+import { PayrollEntryPanel } from '@/components/verification/payroll-entry'
+import { ExpenseAccountPanel, SignoffPackPanel } from '@/components/verification/finance-record-panels'
+import { AgreementPanel, LegalSignoffPanel } from '@/components/verification/legal-record-panels'
+import { AssetRecoveryTask, ManagerExitTask, ManagerHandoverTask } from '@/components/offboarding/offboarding-tasks'
 
 const STATUS_CONFIG: Record<string, { label: string; badge: string }> = {
   allocated: { label: 'Allocated', badge: 'bg-secondary text-muted-foreground' },
   in_progress: { label: 'In Progress', badge: 'bg-yellow-soft text-yellow-ink' },
   completed: { label: 'Completed — awaiting HR verification', badge: 'bg-accent text-blue-ink' },
+}
+
+/** Per-step label overrides for the status pill — display only, the underlying status is unchanged. */
+const STEP_STATUS_LABELS: Record<string, Partial<Record<string, string>>> = {
+  finance_verification: { allocated: 'Awaiting Finance Verification' },
+  legal_verification: { allocated: 'Awaiting Legal Verification' },
+  manager_exit_approval: { allocated: 'Awaiting Manager Approval' },
+  knowledge_transfer: { allocated: 'Awaiting Handover' },
+  it_access_deactivation: { allocated: 'Awaiting IT Verification' },
+  asset_recovery: { allocated: 'Awaiting Asset Recovery' },
+  finance_settlement: { allocated: 'Awaiting Finance Verification' },
+  legal_clearance: { allocated: 'Awaiting Legal Verification' },
 }
 
 /** manager_approval's and it_account_creation's checklists share the same 2-item "review, then
@@ -81,7 +106,22 @@ export function TaskCard({
     authedFetcher(user?.email),
   )
 
-  const config = STATUS_CONFIG[task.status] ?? STATUS_CONFIG.allocated
+  // finance_verification (Fatima) and legal_verification (Lucas): same summary-only shape as the two
+  // above, but the single button reads "Verify" — the department head's own one-time sign-off,
+  // which only moves the task to 'completed'. HR's separate Verify on the timeline still follows.
+  const isDepartmentVerificationTask = task.stepName === 'finance_verification' || task.stepName === 'legal_verification'
+  // Both now have a structured review panel (StructuredReviewTask below); the plain-summary
+  // fallback is kept for any other department-verification step.
+  const isStructuredReviewTask = STRUCTURED_REVIEW_STEPS.has(task.stepName)
+  const { data: departmentSummaryData } = useSWR<{ summary: SimpleSummary }>(
+    expanded && isDepartmentVerificationTask && !isStructuredReviewTask
+      ? `/api/workflows/${task.workflowId}/steps/${task.stepName}/summary`
+      : null,
+    authedFetcher(user?.email),
+  )
+
+  const baseConfig = STATUS_CONFIG[task.status] ?? STATUS_CONFIG.allocated
+  const config = { ...baseConfig, label: STEP_STATUS_LABELS[task.stepName]?.[task.status] ?? baseConfig.label }
 
   function applySubtaskResult(result: { approvalStatus: string; subtasks: Subtask[] }) {
     onUpdated({
@@ -230,6 +270,19 @@ export function TaskCard({
     }
   }
 
+  async function verifyDepartmentSummary() {
+    setPendingId('approve')
+    setActionError(null)
+    try {
+      const result = await authedPost<{ approvalStatus: string }>(`/api/tasks/${task.approvalId}/department-verify`, user?.email)
+      onUpdated({ status: result.approvalStatus })
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : 'Failed to verify')
+    } finally {
+      setPendingId(null)
+    }
+  }
+
   return (
     <div className="rounded-3xl border border-border bg-card p-5 shadow-soft transition-all duration-200 hover:-translate-y-0.5 hover:shadow-lift">
       <div className="flex items-start justify-between gap-3">
@@ -241,6 +294,9 @@ export function TaskCard({
             </span>
             {task.isAdhoc ? (
               <span className="rounded-full bg-blue px-2.5 py-0.5 text-[11px] font-semibold text-blue-ink">Custom</span>
+            ) : null}
+            {task.workflowType === 'offboarding' ? (
+              <span className="rounded-full bg-yellow-soft px-2.5 py-0.5 text-[11px] font-semibold text-yellow-ink">Offboarding · {task.employee.name}</span>
             ) : null}
           </div>
           {task.stepDescription ? <p className="mt-1 text-xs text-muted-foreground">{task.stepDescription}</p> : null}
@@ -308,6 +364,24 @@ export function TaskCard({
               badgeLabel="IT sign-off confirmation"
               waitingLabel="Waiting on IT Account Creation and Asset Allocation to be verified"
             />
+          ) : task.workflowType === 'offboarding' && task.stepName === 'manager_exit_approval' ? (
+            <ManagerExitTask workflowId={task.workflowId} status={task.status} onUpdated={onUpdated} />
+          ) : task.workflowType === 'offboarding' && task.stepName === 'knowledge_transfer' ? (
+            <ManagerHandoverTask workflowId={task.workflowId} status={task.status} onUpdated={onUpdated} />
+          ) : task.workflowType === 'offboarding' && task.stepName === 'asset_recovery' ? (
+            <AssetRecoveryTask workflowId={task.workflowId} status={task.status} onUpdated={onUpdated} />
+          ) : isStructuredReviewTask ? (
+            <StructuredReviewTask task={task} onUpdated={onUpdated} />
+          ) : isDepartmentVerificationTask ? (
+            <SimpleApprove
+              summary={departmentSummaryData?.summary ?? null}
+              approved={task.status === 'completed'}
+              pending={pendingId === 'approve'}
+              onApprove={verifyDepartmentSummary}
+              badgeLabel={task.stepName === 'finance_verification' ? 'Finance pre-check' : 'Legal pre-check'}
+              actionLabel="Verify"
+              doneLabel="Verified — awaiting HR verification"
+            />
           ) : hasSubtasks ? (
             isLoading ? (
               <p className="text-xs text-muted-foreground">Loading checklist…</p>
@@ -355,12 +429,151 @@ export function TaskCard({
   )
 }
 
-/** Shared "AI summary, then approve" UI — used by both asset_allocation and it_verification,
- * which have identical shapes: no subtask checklist at all, just a read-only summary generated
- * up front (on Notify, or once it_verification's own preconditions are met) and one plain
- * "Approve" button, no checkbox. `summary` is null while there's nothing to show yet — for
- * asset_allocation that's only ever a brief instant (Notify generates it before the task appears
- * at all), but for it_verification it can be a real wait, hence `waitingLabel`. */
+type StructuredRunsResponse = {
+  approvalStatus: string | null
+  latest: AiVerificationLog | null
+  review: AiReviewInfo | null
+  history: AiRunHistoryItem[]
+  infoRequest?: InfoRequestSummary | null
+}
+
+const REVIEW_ERROR_MESSAGES: Record<string, string> = {
+  review_required: "Tick \"I've reviewed the flagged issues\" and add a comment before verifying.",
+  rerun_required: 'This run was sent back — re-run the AI once HR has addressed it.',
+  comment_required: 'A comment is required to send this back.',
+  not_ready: 'The AI review has not been generated yet.',
+  approval_locked: 'This task has already been completed.',
+}
+
+const STRUCTURED_REVIEW_STEPS = new Set([
+  'finance_verification',
+  'legal_verification',
+  // Offboarding's AI-automated department steps (same panel; no extra record panels).
+  'it_access_deactivation',
+  'finance_settlement',
+  'legal_clearance',
+])
+
+/** Fatima's finance_verification / Lucas's legal_verification panel: the full itemized AI log (with
+ * evidence and run history), the records the step creates, 
+ * then Verify / Send back. See lib/ai-verification-log.ts for what the log contains and why every
+ * status and evidence row is computed from records rather than model text. */
+function StructuredReviewTask({ task, onUpdated }: { task: TaskItem; onUpdated: (patch: Partial<TaskItem>) => void }) {
+  const { user } = useAuth()
+  const stepBase = `/api/workflows/${task.workflowId}/steps/${task.stepName}`
+  const runsUrl = `${stepBase}/runs`
+  const isFinance = task.stepName === 'finance_verification'
+  const { data, error, isLoading, mutate } = useSWR<StructuredRunsResponse>(runsUrl, authedFetcher(user?.email))
+  const [pending, setPending] = useState<'verify' | 'send_back' | 'rerun' | null>(null)
+  const [actionError, setActionError] = useState<string | null>(null)
+  const completed = task.status === 'completed'
+
+  async function run(kind: 'verify' | 'send_back' | 'rerun', action: () => Promise<void>) {
+    setPending(kind)
+    setActionError(null)
+    try {
+      await action()
+      await mutate()
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Request failed'
+      setActionError(REVIEW_ERROR_MESSAGES[message] ?? message)
+    } finally {
+      setPending(null)
+    }
+  }
+
+  // Each created record can unblock the next (e.g. payroll + expense -> sign-off pack), so refresh
+  // every draft for this step now, and the AI log a few times while its background re-run lands.
+  const { mutate: mutateGlobal } = useSWRConfig()
+  function refreshAfterCreate() {
+    void mutateGlobal((key) => typeof key === 'string' && key.startsWith(`${stepBase}/`))
+    ;[4000, 10000, 20000, 40000, 60000].forEach((ms) => setTimeout(() => void mutate(), ms))
+  }
+
+  const rerun = () => run('rerun', async () => void (await authedPost(runsUrl, user?.email)))
+  const verify = (input: { acknowledged: boolean; comment: string }) =>
+    run('verify', async () => {
+      const result = await authedPost<{ approvalStatus: string }>(`/api/tasks/${task.approvalId}/department-verify`, user?.email, input)
+      onUpdated({ status: result.approvalStatus })
+    })
+  const sendBack = (comment: string) =>
+    run('send_back', async () => void (await authedPost(`/api/tasks/${task.approvalId}/send-back`, user?.email, { comment })))
+
+  if (isLoading) return <p className="text-xs text-muted-foreground">Loading AI review…</p>
+  if (error) return <p className="text-xs font-medium text-destructive">{error.message}</p>
+
+  const latest = data?.latest ?? null
+  const sentBack = data?.review?.action === 'sent_back'
+  return (
+    <div className="space-y-3">
+      {latest ? (
+        <AiReviewLog
+          log={latest}
+          history={data?.history ?? []}
+          review={data?.review ?? null}
+          readOnly={completed}
+          onRerun={rerun}
+          rerunning={pending === 'rerun'}
+          onOpenLink={(link) => openAuthedLink(link, user?.email)}
+        />
+      ) : (
+        <div className="flex flex-wrap items-center gap-3">
+          <p className="text-xs text-muted-foreground">No AI review has been run for this task yet.</p>
+          <button
+            type="button"
+            onClick={rerun}
+            disabled={pending !== null}
+            className="inline-flex items-center gap-1.5 rounded-xl bg-primary px-3 py-1.5 text-xs font-semibold text-primary-foreground disabled:opacity-60"
+          >
+            {pending === 'rerun' ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Sparkles className="h-3.5 w-3.5" />}
+            Run AI review
+          </button>
+        </div>
+      )}
+
+      {!completed && data?.infoRequest ? <InfoRequestStatus request={data.infoRequest} /> : null}
+
+      {latest && isFinance ? (
+        <>
+          <PayrollEntryPanel workflowId={task.workflowId} readOnly={completed} onCreated={refreshAfterCreate} />
+          <ExpenseAccountPanel workflowId={task.workflowId} readOnly={completed} onCreated={refreshAfterCreate} />
+          <SignoffPackPanel workflowId={task.workflowId} readOnly={completed} onCreated={refreshAfterCreate} />
+        </>
+      ) : latest && task.stepName === 'legal_verification' ? (
+        <>
+          <AgreementPanel workflowId={task.workflowId} readOnly={completed} onCreated={refreshAfterCreate} />
+          <LegalSignoffPanel workflowId={task.workflowId} readOnly={completed} onCreated={refreshAfterCreate} />
+        </>
+      ) : null}
+
+      {completed ? (
+        <p className="flex items-center gap-1.5 text-xs font-semibold text-[#1f8a52]">
+          <Check className="h-3.5 w-3.5" />
+          Verified — awaiting HR verification
+        </p>
+      ) : latest && sentBack ? (
+        <p className="text-xs font-medium text-muted-foreground">Sent back to HR — re-run the AI once they&apos;ve addressed your comment.</p>
+      ) : latest ? (
+        <AiReviewDecision
+          key={latest.runId}
+          overallStatus={latest.overallStatus}
+          pending={pending === 'verify' || pending === 'send_back' ? pending : null}
+          onVerify={verify}
+          onSendBack={sendBack}
+        />
+      ) : null}
+      {actionError ? <p className="text-xs font-medium text-destructive">{actionError}</p> : null}
+    </div>
+  )
+}
+
+/** Shared "AI summary, then one button" UI — used by asset_allocation and it_verification
+ * ("Approve") and finance_verification / legal_verification ("Verify"), which all have identical
+ * shapes: no subtask checklist at all, just a read-only summary generated up front (on Notify, or
+ * once it_verification's own preconditions are met) and one plain button, no checkbox. `summary`
+ * is null while there's nothing to show yet — for most steps that's only ever a brief instant
+ * (Notify generates it before the task appears at all), but for it_verification it can be a real
+ * wait, hence `waitingLabel`. */
 function SimpleApprove({
   summary,
   approved,
@@ -368,6 +581,8 @@ function SimpleApprove({
   onApprove,
   badgeLabel,
   waitingLabel,
+  actionLabel = 'Approve',
+  doneLabel = 'Approved',
 }: {
   summary: SimpleSummary | null
   approved: boolean
@@ -375,6 +590,8 @@ function SimpleApprove({
   onApprove: () => void
   badgeLabel: string
   waitingLabel?: string
+  actionLabel?: string
+  doneLabel?: string
 }) {
   if (!summary) {
     return <p className="text-xs text-muted-foreground">{waitingLabel ?? 'Generating summary…'}</p>
@@ -390,7 +607,7 @@ function SimpleApprove({
       {approved ? (
         <p className="flex items-center gap-1.5 text-xs font-semibold text-[#1f8a52]">
           <Check className="h-3.5 w-3.5" />
-          Approved
+          {doneLabel}
         </p>
       ) : (
         <button
@@ -399,7 +616,7 @@ function SimpleApprove({
           className="inline-flex items-center gap-1.5 rounded-xl bg-[#1f8a52] px-3 py-2 text-xs font-semibold text-white shadow-soft transition-all duration-200 hover:-translate-y-0.5 hover:shadow-lift disabled:pointer-events-none disabled:opacity-60"
         >
           {pending ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <ShieldCheck className="h-3.5 w-3.5" />}
-          Approve
+          {actionLabel}
         </button>
       )}
     </>
