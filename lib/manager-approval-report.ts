@@ -1,4 +1,5 @@
 import { GoogleGenAI } from '@google/genai'
+import { GEMINI_REQUEST_OPTIONS } from '@/lib/gemini-request-options'
 
 const SYSTEM_PROMPT =
   'You are an IT operations assistant finalizing a new employee\'s team and access assignment. ' +
@@ -65,7 +66,7 @@ async function compileTeamAssignmentMarkdown(input: TeamAssignmentInput): Promis
       system_instruction: SYSTEM_PROMPT,
       input: `Team assignment data:\n\n${JSON.stringify(data, null, 2)}`,
       generation_config: { max_output_tokens: 1024 },
-    })
+    }, GEMINI_REQUEST_OPTIONS)
 
     const text = response.output_text?.trim()
     return text || fallbackMarkdown(input)

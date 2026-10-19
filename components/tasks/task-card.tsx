@@ -20,6 +20,8 @@ import { InfoRequestStatus, type InfoRequestSummary } from '@/components/verific
 import { PayrollEntryPanel } from '@/components/verification/payroll-entry'
 import { ExpenseAccountPanel, SignoffPackPanel } from '@/components/verification/finance-record-panels'
 import { AgreementPanel, LegalSignoffPanel } from '@/components/verification/legal-record-panels'
+import { FinalPayPanel } from '@/components/offboarding/final-pay-panel'
+import { LegalClearancePanel } from '@/components/offboarding/legal-clearance-panel'
 import { AssetRecoveryTask, ManagerExitTask, ManagerHandoverTask } from '@/components/offboarding/offboarding-tasks'
 
 const STATUS_CONFIG: Record<string, { label: string; badge: string }> = {
@@ -487,7 +489,7 @@ function StructuredReviewTask({ task, onUpdated }: { task: TaskItem; onUpdated: 
   const { mutate: mutateGlobal } = useSWRConfig()
   function refreshAfterCreate() {
     void mutateGlobal((key) => typeof key === 'string' && key.startsWith(`${stepBase}/`))
-    ;[4000, 10000, 20000, 40000, 60000].forEach((ms) => setTimeout(() => void mutate(), ms))
+    ;[4000, 10000, 20000, 40000, 60000, 90000].forEach((ms) => setTimeout(() => void mutate(), ms))
   }
 
   const rerun = () => run('rerun', async () => void (await authedPost(runsUrl, user?.email)))
@@ -544,6 +546,10 @@ function StructuredReviewTask({ task, onUpdated }: { task: TaskItem; onUpdated: 
           <AgreementPanel workflowId={task.workflowId} readOnly={completed} onCreated={refreshAfterCreate} />
           <LegalSignoffPanel workflowId={task.workflowId} readOnly={completed} onCreated={refreshAfterCreate} />
         </>
+      ) : latest && task.stepName === 'finance_settlement' ? (
+        <FinalPayPanel workflowId={task.workflowId} readOnly={completed} onSaved={refreshAfterCreate} />
+      ) : latest && task.stepName === 'legal_clearance' ? (
+        <LegalClearancePanel workflowId={task.workflowId} readOnly={completed} onSaved={refreshAfterCreate} />
       ) : null}
 
       {completed ? (

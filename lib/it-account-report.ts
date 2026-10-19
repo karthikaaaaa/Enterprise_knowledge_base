@@ -1,5 +1,6 @@
 import crypto from 'node:crypto'
 import { GoogleGenAI } from '@google/genai'
+import { GEMINI_REQUEST_OPTIONS } from '@/lib/gemini-request-options'
 
 const SYSTEM_PROMPT =
   'You are an IT operations assistant confirming a new employee\'s account and access setup. ' +
@@ -60,7 +61,7 @@ async function compileCredentialsMarkdown(input: ItAccountCredentialsInput, temp
       system_instruction: SYSTEM_PROMPT,
       input: `Account setup data:\n\n${JSON.stringify(data, null, 2)}`,
       generation_config: { max_output_tokens: 1024 },
-    })
+    }, GEMINI_REQUEST_OPTIONS)
 
     const text = response.output_text?.trim()
     return text || fallbackMarkdown(input, tempPassword)

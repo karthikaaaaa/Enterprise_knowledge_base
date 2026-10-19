@@ -168,7 +168,8 @@ describe('legal verification end to end', () => {
     assert.deepEqual(await sign(employeeUserId, 'A. Easley', true), { ok: false, error: 'name_mismatch' })
     assert.equal(latestLog().tasks.find((t) => t.id === 'confidentiality_agreement')!.status, 'warning')
 
-    const signed = await sign(employeeUserId, '  annie   EASLEY ', true)
+    // "Accept all terms": no typed name — signed under the legal name on file.
+    const signed = await sign(employeeUserId, undefined, true)
     assert.ok(signed.ok)
     assert.deepEqual(await sign(employeeUserId, 'Annie Easley', true), { ok: false, error: 'already_signed' })
     assert.equal(getAgreementToSign(workflowId), null)
@@ -184,8 +185,18 @@ describe('legal verification end to end', () => {
   })
 
   test('the compliance pack makes the run "ready" and Legal verifies without a flagged-issues review', async () => {
+    // A slow re-run (e.g. the one the employee's signature kicked off) reads the records before the
+    // pack exists and finishes after the pack's own re-run — it must not overwrite the newer result.
+    let releaseSlow!: () => void
+    const slowGate = new Promise<void>((resolve) => (releaseSlow = resolve))
+    const slow = rerunStructuredReview(workflowId, 'legal_verification', employeeUserId, async (...args) => {
+      await slowGate
+      return stub(...args)
+    })
     const pack = await createLegalSignoffPack(workflowId, legalId, { generate: stub })
     assert.ok(pack.ok)
+    releaseSlow()
+    assert.ok((await slow).ok)
     assert.equal(pack.ok && pack.record.snapshot.agreementId, store.getLegalAgreementByWorkflow(workflowId)?.id)
     const log = latestLog()
     assert.deepEqual(log.tasks.map((t) => t.status), ['done', 'done', 'done', 'done'])

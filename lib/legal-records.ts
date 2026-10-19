@@ -128,8 +128,11 @@ export async function signAgreement(
   if (agreement.signedAt) return { ok: false, error: 'already_signed' }
   if (input.consent !== true) return { ok: false, error: 'consent_required' }
 
-  const signedName = typeof input.signedName === 'string' ? input.signedName.trim().replace(/\s+/g, ' ') : ''
   const legalName = compileLegalVerificationSource(workflowId).submission?.fullName ?? ''
+  // "Accept all terms" sends no typed name — the employee is signed in as themselves, so the
+  // signature is recorded under the legal name on file. A typed name must still match it.
+  const signedName =
+    input.signedName === undefined ? legalName.trim().replace(/\s+/g, ' ') : typeof input.signedName === 'string' ? input.signedName.trim().replace(/\s+/g, ' ') : ''
   if (!signedName || !legalName || normalizeName(signedName) !== normalizeName(legalName)) {
     return { ok: false, error: 'name_mismatch' }
   }

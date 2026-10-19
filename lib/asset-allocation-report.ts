@@ -1,4 +1,5 @@
 import { GoogleGenAI } from '@google/genai'
+import { GEMINI_REQUEST_OPTIONS } from '@/lib/gemini-request-options'
 
 /** Fixed catalog of what onboarding hands every new hire — never invented per-employee, always
  * exactly this list (see the system prompt below). */
@@ -44,7 +45,7 @@ async function compileSummary(input: AssetAllocationInput): Promise<string> {
       system_instruction: SYSTEM_PROMPT,
       input: `Asset allocation data:\n\n${JSON.stringify(data, null, 2)}`,
       generation_config: { max_output_tokens: 1024 },
-    })
+    }, GEMINI_REQUEST_OPTIONS)
 
     const text = response.output_text?.trim()
     return text || fallbackSummary(input)

@@ -27,6 +27,7 @@ import {
 import { OFFBOARDING_TASK_IDS, type OffboardingReviewKey } from '@/lib/offboarding/reviews'
 import { offboardingStatusForUser } from '@/lib/offboarding/access'
 import * as off from '@/lib/offboarding/store'
+import { enterFinalPay } from '@/lib/offboarding/final-pay'
 
 /** A model stub that returns valid JSON for whichever review is asking (and plain text for the handover). */
 const stub: NarrativeGenerator = async (system) => {
@@ -213,6 +214,8 @@ describe('offboarding end to end', () => {
     assert.equal(statement.deductions.length, 1)
     assert.ok((await rerunStructuredReview(wf, 'finance_settlement', fin, stub)).ok)
     assert.equal((store.getDb().prepare('SELECT COUNT(*) n FROM settlement_statements WHERE workflow_id = ?').get(wf) as { n: number }).n, 1)
+    // Calculated from payroll — Finance can't override it with a hand-entered figure.
+    assert.deepEqual(await enterFinalPay(wf, fin, { amount: 1, currency: 'USD', note: '' }, { generate: stub }), { ok: false, error: 'already_calculated' })
     // Flagged (reimbursements can't be confirmed) → Verify needs the acknowledgement.
     assert.deepEqual(verifyDepartmentSummaryStep(approval('finance_settlement')!.id, fin), { ok: false, error: 'review_required' })
     await deptVerify('finance_settlement', fin)

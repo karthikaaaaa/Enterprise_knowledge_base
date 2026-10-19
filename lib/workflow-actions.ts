@@ -379,6 +379,9 @@ function latestFinanceDetails(workflowId: string): FinanceVerificationSource['fi
 export type RerunStructuredReviewError = 'workflow_not_found' | 'step_not_found' | 'not_notified' | 'already_verified'
 export type RerunFinanceVerificationError = RerunStructuredReviewError
 
+/** Per workflow+step: how many re-runs have started, and the newest one whose result was saved. */
+const reviewSequence = new Map<string, { started: number; saved: number; savedRunId: string }>()
+
 /** "Re-run AI" on a structured review (Fatima's / Lucas's panel, or automatically after a record is
  * created): a fresh run against the current records, appended to the history (nothing is
  * overwritten). Only while the step is still awaiting its department — once they've verified it,
@@ -396,7 +399,22 @@ export async function rerunStructuredReview(
   if (!approval) return { ok: false, error: 'not_notified' }
   if (approval.status === 'completed' || approval.status === 'verified') return { ok: false, error: 'already_verified' }
 
+  // Re-runs overlap (e.g. the employee signs, then Legal creates the pack seconds later) and the
+  // model call can take a minute — a run that started earlier read older records, so it must not
+  // land on top of a newer run that already saved.
+  const key = `${workflowId}:${stepKey}`
+  const seq = reviewSequence.get(key) ?? { started: 0, saved: 0, savedRunId: '' }
+  reviewSequence.set(key, seq)
+  const mySeq = ++seq.started
   const log = await runStructuredReview(stepKey, workflowId, generate, requestedByUserId)
+  // The step was reverted (approval gone or replaced) or verified while the model call was in
+  // flight — this review belongs to a round that no longer exists, so drop it.
+  const current = getLatestApprovalForStep(workflowId, step.id)
+  if (!current || current.id !== approval.id) return { ok: false, error: 'not_notified' }
+  if (current.status === 'completed' || current.status === 'verified') return { ok: false, error: 'already_verified' }
+  if (mySeq < seq.saved) return { ok: true, runId: seq.savedRunId }
+  seq.saved = mySeq
+  seq.savedRunId = log.runId
   runInTransaction(() => {
     createStepAiSummary({ workflowId, stepId: step.id, approvalId: approval.id, stepKey, summaryText: log.shortSummary, generatedAt: log.generatedAt })
     createAiVerificationRun({ id: log.runId, workflowId, stepKey, approvalId: approval.id, result: log, generatedBy: requestedByUserId })

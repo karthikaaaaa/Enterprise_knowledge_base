@@ -71,7 +71,7 @@ export async function revertStep(
   workflowId: string,
   stepId: string,
   performedByUserId: string,
-  /** Why HR is reverting — recorded in the audit log. Required by the route for offboarding. */
+  /** Why HR is reverting — recorded in the audit log. Optional. */
   reason: string | null = null,
 ): Promise<RevertResult> {
   const workflow = getWorkflow(workflowId)

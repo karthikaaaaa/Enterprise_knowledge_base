@@ -134,7 +134,7 @@ describe('offboarding: reverting Exit Initiated undoes the whole offboarding', (
   })
 
   test('reverting Exit Initiated cascades through every step and restores everything', async () => {
-    assert.equal((await revertStep(wf, stepId('exit_initiated'), hr, '')).ok, true, 'the library accepts it; the route requires the reason')
+    assert.equal((await revertStep(wf, stepId('exit_initiated'), hr, '')).ok, true, 'a reason is optional')
   })
 
   test('…every later step is Pending again (no approvals, no tasks left)', () => {

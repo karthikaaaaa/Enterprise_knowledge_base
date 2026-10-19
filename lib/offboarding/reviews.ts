@@ -35,6 +35,7 @@ import {
   listAssetReturnItems,
   upsertSettlementStatement,
   getSettlementStatement,
+  listWorkflowEvents,
   type ExitDetails,
 } from '@/lib/offboarding/store'
 import { directoryService } from '@/lib/offboarding/directory-service'
@@ -467,24 +468,66 @@ function daysInMonth(isoDate: string) {
   return new Date(Date.UTC(y, m, 0)).getUTCDate()
 }
 
-/** The settlement figures, from records only. Without a salary on file the final pay is a labelled
- * placeholder (null), never an invented number. */
+/** The final pay Finance entered by hand (lib/offboarding/final-pay.ts), kept on the settlement
+ * statement — so reverting Finance Settlement (which voids the statement) clears it too. */
+export type ManualFinalPay = { amount: number; currency: string; note: string | null; enteredBy: string; enteredByName: string; enteredAt: string }
+
+export function manualFinalPayFor(workflowId: string): ManualFinalPay | null {
+  return (getSettlementStatement(workflowId)?.statement.manualFinalPay as ManualFinalPay | undefined) ?? null
+}
+
+/** Finance's confirmation of pending reimbursements (lib/offboarding/final-pay.ts) — no claims
+ * system is connected, so Finance confirms either that nothing is outstanding or the amount to pay
+ * with the settlement. Kept on the statement, so reverting Finance Settlement clears it too. */
+export type ReimbursementConfirmation = {
+  outstanding: boolean
+  amount: number | null
+  currency: string | null
+  note: string | null
+  confirmedBy: string
+  confirmedByName: string
+  confirmedAt: string
+}
+
+export function reimbursementConfirmationFor(workflowId: string): ReimbursementConfirmation | null {
+  return (getSettlementStatement(workflowId)?.statement.reimbursementConfirmation as ReimbursementConfirmation | undefined) ?? null
+}
+
+function reimbursementSummary(c: ReimbursementConfirmation) {
+  return c.outstanding && c.amount !== null && c.currency
+    ? `${c.currency} ${c.amount.toLocaleString('en-US', { minimumFractionDigits: 2 })} outstanding — paid with the final settlement`
+    : 'None outstanding'
+}
+
+/** The settlement figures, from records only. Without a salary on file the final pay is the figure
+ * Finance entered, or else a labelled placeholder (null) — never an invented number. A figure
+ * calculated from payroll always wins over an entered one. */
 export function computeSettlement(ctx: OffboardingContext, details: ExitDetails) {
   const records = listFinanceRecordsForEmployee(ctx.employee.id)
   const payroll = records.payroll.find((p) => !p.endedAt || p.endedByWorkflowId === ctx.workflow.id) ?? null
   const lwd = details.lastWorkingDay
-  let finalPay: { amount: number | null; currency: string | null; basis: string; placeholder: boolean }
+  const manual = manualFinalPayFor(ctx.workflow.id)
+  let finalPay: { amount: number | null; currency: string | null; basis: string; placeholder: boolean; source: 'payroll' | 'finance' | 'placeholder' }
   if (payroll && lwd) {
     const day = Number(lwd.slice(8, 10))
     const dim = daysInMonth(lwd)
     const amount = Math.round(((payroll.annualSalary / 12) * (day / dim)) * 100) / 100
-    finalPay = { amount, currency: payroll.currency, basis: `Calculated: ${payroll.currency} ${payroll.annualSalary.toLocaleString('en-US')}/yr ÷ 12 × ${day}/${dim} calendar days of ${lwd.slice(0, 7)} (payroll_records/${payroll.id})`, placeholder: false }
+    finalPay = { amount, currency: payroll.currency, basis: `Calculated: ${payroll.currency} ${payroll.annualSalary.toLocaleString('en-US')}/yr ÷ 12 × ${day}/${dim} calendar days of ${lwd.slice(0, 7)} (payroll_records/${payroll.id})`, placeholder: false, source: 'payroll' }
+  } else if (manual) {
+    finalPay = {
+      amount: manual.amount,
+      currency: manual.currency,
+      basis: `Entered by Finance (${manual.enteredByName}) at ${utcStamp(manual.enteredAt)}${manual.note ? ` — ${manual.note}` : ''}`,
+      placeholder: false,
+      source: 'finance',
+    }
   } else {
     finalPay = {
       amount: null,
       currency: null,
       basis: payroll ? 'Placeholder — no last working day recorded' : 'Placeholder — no salary on file (no payroll entry for this employee); Finance must enter the final pay',
       placeholder: true,
+      source: 'placeholder',
     }
   }
   const missingAssets = listAssetReturnItems(ctx.workflow.id).filter((i) => i.status === 'missing')
@@ -511,13 +554,19 @@ function applySettlementActions(ctx: OffboardingContext, details: ExitDetails, u
     upsertAccessAction({ workflowId: wf, system: 'expense', targetRef: e.id, description: `Expense account closed ${endDate}`, action: 'deactivated', externalRef: null, effectiveDate: endDate, createdBy: userId })
   }
   const s = computeSettlement(ctx, details)
+  const manualFinalPay = manualFinalPayFor(wf)
+  const reimbursementConfirmation = reimbursementConfirmationFor(wf)
   upsertSettlementStatement(wf, {
     employee: ctx.name,
     lastWorkingDay: details.lastWorkingDay,
     finalPay: s.finalPay,
-    reimbursements: { status: 'none_recorded', note: 'No reimbursement-claims system is connected; no claims are on record.' },
+    reimbursements: reimbursementConfirmation
+      ? { status: reimbursementConfirmation.outstanding ? 'outstanding' : 'none_outstanding', amount: reimbursementConfirmation.amount, currency: reimbursementConfirmation.currency, note: `Confirmed by Finance (${reimbursementConfirmation.confirmedByName})` }
+      : { status: 'none_recorded', note: 'No reimbursement-claims system is connected; no claims are on record.' },
     deductions: s.deductions,
     deactivated: listAccessActions(wf, true).filter((a) => a.system === 'payroll' || a.system === 'expense').map((a) => a.targetRef),
+    ...(manualFinalPay ? { manualFinalPay } : {}),
+    ...(reimbursementConfirmation ? { reimbursementConfirmation } : {}),
   })
 }
 
@@ -526,6 +575,7 @@ function buildSettlementFacts({ ctx, details }: SettlementSource): AiLogFacts<st
   const s = computeSettlement(ctx, details)
   const statement = getSettlementStatement(wf)
   const ended = listAccessActions(wf, true).filter((a) => a.system === 'payroll' || a.system === 'expense')
+  const reimb = reimbursementConfirmationFor(wf)
   const missingData: string[] = []
   if (s.finalPay.placeholder) missingData.push('Salary / final pay figure')
 
@@ -535,7 +585,13 @@ function buildSettlementFacts({ ctx, details }: SettlementSource): AiLogFacts<st
         id: 'final_pay',
         title: 'Final pay to last working day',
         status: s.finalPay.placeholder ? 'warning' : 'done',
-        actionsTaken: [s.payroll ? `Read payroll entry ${s.payroll.id} and prorated pay to the last working day.` : 'Looked for a payroll entry for this employee — none on file.'],
+        actionsTaken: [
+          s.finalPay.source === 'finance'
+            ? 'The final pay could not be calculated from payroll — used the figure Finance entered.'
+            : s.payroll
+              ? `Read payroll entry ${s.payroll.id} and prorated pay to the last working day.`
+              : 'Looked for a payroll entry for this employee — none on file.',
+        ],
         evidence: [
           {
             type: 'check',
@@ -550,11 +606,22 @@ function buildSettlementFacts({ ctx, details }: SettlementSource): AiLogFacts<st
       {
         id: 'reimbursements',
         title: 'Pending reimbursements',
-        status: 'warning',
-        actionsTaken: ['Looked for pending reimbursement claims.'],
-        evidence: [{ type: 'check', label: 'Reimbursement claims', value: 'None on record', source: 'No reimbursement-claims system is connected' }],
-        issues: ['No reimbursement-claims system is connected — confirm with the employee that nothing is outstanding.'],
-        fallbackRecommendation: 'Confirm no reimbursements are outstanding.',
+        status: reimb ? 'done' : 'warning',
+        actionsTaken: reimb
+          ? ['Looked for pending reimbursement claims — no claims system is connected, so used the confirmation Finance recorded.']
+          : ['Looked for pending reimbursement claims.'],
+        evidence: reimb
+          ? [
+              {
+                type: 'check',
+                label: 'Reimbursement claims',
+                value: reimbursementSummary(reimb),
+                source: `Confirmed by Finance (${reimb.confirmedByName}) at ${utcStamp(reimb.confirmedAt)}${reimb.note ? ` — ${reimb.note}` : ''}`,
+              },
+            ]
+          : [{ type: 'check', label: 'Reimbursement claims', value: 'None on record', source: 'No reimbursement-claims system is connected' }],
+        issues: reimb ? [] : ['No reimbursement-claims system is connected — confirm with the employee that nothing is outstanding.'],
+        fallbackRecommendation: reimb ? (reimb.outstanding ? 'Pay the outstanding reimbursements with the final settlement.' : 'No reimbursements to pay.') : 'Confirm no reimbursements are outstanding.',
       },
       {
         id: 'asset_deductions',
@@ -605,7 +672,8 @@ const SETTLEMENT_CONFIG: AiVerificationStepConfig<SettlementSource, string> = {
 
 type LegalClearanceSource = { ctx: OffboardingContext; details: ExitDetails }
 
-function buildLegalClearanceFacts({ ctx, details }: LegalClearanceSource): AiLogFacts<string> {
+/** What Legal can find on record: signed agreements, and non-compete / notice clauses in the offer letter. */
+export function legalClearanceRecords(ctx: OffboardingContext) {
   const agreements = getDb()
     .prepare('SELECT id, title, version, signed_at, signed_name FROM legal_agreements WHERE employee_id = ?')
     .all(ctx.employee.id) as { id: string; title: string; version: string; signed_at: string | null; signed_name: string | null }[]
@@ -613,15 +681,71 @@ function buildLegalClearanceFacts({ ctx, details }: LegalClearanceSource): AiLog
   const docs = listWorkflowsByEmployee(ctx.employee.id).flatMap((w) => listEmployeeDocumentsByWorkflow(w.id))
   const offer = docs.find((d) => d.documentType === 'offer_letter')
   const clauseFields = offer ? Object.entries(offer.extractedFields).filter(([k]) => /non.?compete|notice|restrict|solicit/i.test(k)) : []
+  return { signed, offer, clauseFields }
+}
+
+/** What Legal confirmed by hand when the records can't settle a task (lib/offboarding/legal-clearance.ts):
+ * the employee acknowledged their confidentiality obligations at exit, or Legal reviewed the
+ * contract for restrictive covenants. Kept as workflow events; only those after the latest revert
+ * of Legal Clearance count, so reverting the step clears them. */
+export type LegalConfirmationTask = 'confidentiality_obligations' | 'restrictive_covenants'
+export type LegalConfirmation = {
+  task: LegalConfirmationTask
+  /** restrictive_covenants only: whether any non-compete / notice clauses apply. */
+  clausesApply: boolean | null
+  clauses: string | null
+  note: string | null
+  confirmedBy: string | null
+  confirmedByName: string
+  confirmedAt: string
+}
+
+export function legalConfirmationsFor(workflowId: string): Record<LegalConfirmationTask, LegalConfirmation | null> {
+  const result: Record<LegalConfirmationTask, LegalConfirmation | null> = { confidentiality_obligations: null, restrictive_covenants: null }
+  for (const e of listWorkflowEvents(workflowId)) {
+    if (e.stepKey !== 'legal_clearance') continue
+    if (e.action === 'reverted') {
+      result.confidentiality_obligations = null
+      result.restrictive_covenants = null
+    } else if (e.action === 'legal_confirmed' && (e.detail.task === 'confidentiality_obligations' || e.detail.task === 'restrictive_covenants')) {
+      result[e.detail.task as LegalConfirmationTask] = {
+        task: e.detail.task,
+        clausesApply: typeof e.detail.clausesApply === 'boolean' ? e.detail.clausesApply : null,
+        clauses: e.detail.clauses ?? null,
+        note: e.detail.note ?? null,
+        confirmedBy: e.performedBy,
+        confirmedByName: e.detail.confirmedByName ?? 'Legal',
+        confirmedAt: e.performedAt,
+      }
+    }
+  }
+  return result
+}
+
+function confirmedBy(c: LegalConfirmation) {
+  return `Confirmed by Legal (${c.confirmedByName}) at ${utcStamp(c.confirmedAt)}${c.note ? ` — ${c.note}` : ''}`
+}
+
+function buildLegalClearanceFacts({ ctx, details }: LegalClearanceSource): AiLogFacts<string> {
+  const { signed, offer, clauseFields } = legalClearanceRecords(ctx)
+  const confirmations = legalConfirmationsFor(ctx.workflow.id)
+  const ack = signed.length === 0 ? confirmations.confidentiality_obligations : null
+  const review = clauseFields.length === 0 ? confirmations.restrictive_covenants : null
   const missingData: string[] = []
 
   const confidentiality: Facts = {
     id: 'confidentiality_obligations',
     title: 'Confidentiality / IP obligations',
-    status: signed.length > 0 ? 'done' : 'warning',
-    actionsTaken: ['Looked for signed confidentiality / NDA agreements on file.'],
-    evidence:
-      signed.length > 0
+    status: signed.length > 0 || ack ? 'done' : 'warning',
+    actionsTaken: ack
+      ? ['Looked for signed confidentiality / NDA agreements on file — none, so used the acknowledgement Legal recorded.']
+      : ['Looked for signed confidentiality / NDA agreements on file.'],
+    evidence: ack
+      ? [
+          { type: 'check', label: 'Signed agreements', value: 'None on file', source: `legal_agreements (employee ${ctx.employee.id})` },
+          { type: 'check', label: 'Confidentiality obligations', value: 'Employee acknowledged their confidentiality / IP obligations at exit', source: confirmedBy(ack) },
+        ]
+      : signed.length > 0
         ? signed.map((a) => ({
             type: 'document' as const,
             label: a.title,
@@ -629,27 +753,51 @@ function buildLegalClearanceFacts({ ctx, details }: LegalClearanceSource): AiLog
             source: `legal_agreements/${a.id}`,
           }))
         : [{ type: 'check', label: 'Signed agreements', value: 'None on file', source: `legal_agreements (employee ${ctx.employee.id})` }],
-    issues: signed.length > 0 ? [] : ['No signed confidentiality agreement is on file — remind the employee of their general confidentiality obligations.'],
-    fallbackRecommendation: signed.length > 0 ? 'Remind the employee of the post-exit confidentiality term.' : 'Send a confidentiality reminder with the exit paperwork.',
+    issues: signed.length > 0 || ack ? [] : ['No signed confidentiality agreement is on file — remind the employee of their general confidentiality obligations.'],
+    fallbackRecommendation: signed.length > 0
+      ? 'Remind the employee of the post-exit confidentiality term.'
+      : ack
+        ? 'Keep the acknowledgement with the exit paperwork.'
+        : 'Send a confidentiality reminder with the exit paperwork.',
   }
-  if (signed.length === 0) missingData.push('Signed confidentiality agreement')
+  if (signed.length === 0 && !ack) missingData.push('Signed confidentiality agreement')
 
   const covenants: Facts = {
     id: 'restrictive_covenants',
     title: 'Non-compete / notice clauses',
-    status: clauseFields.length > 0 ? 'done' : 'warning',
-    actionsTaken: [offer ? `Read the offer letter (${offer.fileName}) for non-compete / notice clauses.` : 'Looked for an offer letter — none on file.'],
-    evidence: offer
-      ? [
-          { type: 'document', label: 'Offer letter', value: offer.fileName, source: `employee_documents/${offer.id}` },
-          ...clauseFields.map(([k, v]) => ({ type: 'profile_field' as const, label: k, value: v, source: `employee_documents/${offer.id}.extracted_fields.${k}` })),
-        ]
-      : [{ type: 'check', label: 'Offer letter', value: 'Not on file', source: `employee_documents (employee ${ctx.employee.id})` }],
+    status: clauseFields.length > 0 || review ? 'done' : 'warning',
+    actionsTaken: [
+      offer ? `Read the offer letter (${offer.fileName}) for non-compete / notice clauses.` : 'Looked for an offer letter — none on file.',
+      ...(review ? ['Used the contract review Legal recorded.'] : []),
+    ],
+    evidence: [
+      ...(offer
+        ? [
+            { type: 'document' as const, label: 'Offer letter', value: offer.fileName, source: `employee_documents/${offer.id}` },
+            ...clauseFields.map(([k, v]) => ({ type: 'profile_field' as const, label: k, value: v, source: `employee_documents/${offer.id}.extracted_fields.${k}` })),
+          ]
+        : [{ type: 'check' as const, label: 'Offer letter', value: 'Not on file', source: `employee_documents (employee ${ctx.employee.id})` }]),
+      ...(review
+        ? [
+            {
+              type: 'check' as const,
+              label: 'Restrictive covenants (reviewed by Legal)',
+              value: review.clausesApply ? `Apply: ${review.clauses}` : 'None apply',
+              source: confirmedBy(review),
+            },
+          ]
+        : []),
+    ],
     issues:
-      clauseFields.length > 0
+      clauseFields.length > 0 || review
         ? []
         : [offer ? 'The offer letter is on file but no non-compete or notice clause was extracted — review the letter manually.' : 'No offer letter is on file to check for restrictive covenants.'],
-    fallbackRecommendation: clauseFields.length > 0 ? 'Remind the employee of the clauses found.' : 'Review the employment contract manually.',
+    fallbackRecommendation:
+      clauseFields.length > 0 || review?.clausesApply
+        ? 'Remind the employee of the clauses found.'
+        : review
+          ? 'No restrictive covenants to remind the employee of.'
+          : 'Review the employment contract manually.',
   }
 
   const releaseIssues: string[] = []

@@ -32,6 +32,7 @@ import type { AiLogHrSummary, AiVerificationLog } from '@/lib/ai-verification-lo
 import {
   AiReviewLog,
   AiReviewShortSummary,
+  AiReviewTaskList,
   openAuthedLink,
   type AiReviewInfo,
   type AiRunHistoryItem,
@@ -321,7 +322,7 @@ export function WorkflowTimeline({
    * and each step's own canRevert (not pending) to decide whether a given card's button shows. */
   canRevert?: boolean
   onRevert?: (stepId: string, reason?: string) => Promise<void>
-  /** Offboarding: the revert dialog asks for a reason, which is required. Off by default. */
+  /** Offboarding: the revert dialog asks for an (optional) reason. Off by default. */
   requireRevertReason?: boolean
   /** Extra warning shown in the revert dialog for a given step (e.g. reverting Exit Initiated undoes
    * the whole offboarding). Omitted / null: no extra warning, as before. */
@@ -700,6 +701,7 @@ export function WorkflowTimeline({
                             review={step.structuredReview.review}
                             badgeLabel={step.structuredReview.badgeLabel}
                           />
+                          <StructuredReviewTasks url={step.structuredReview.fullLogUrl} />
                           <StructuredReviewInfoRequest structuredReview={step.structuredReview} canManage={canManage} />
                         </div>
                       ) : step.departmentSummary ? (
@@ -936,7 +938,7 @@ export function WorkflowTimeline({
                 value={revertReason}
                 onChange={(e) => setRevertReason(e.target.value)}
                 rows={3}
-                placeholder="Reason for reverting (required — recorded in the audit log and sent to everyone affected)"
+                placeholder="Reason for reverting (optional — recorded in the audit log and sent to everyone affected)"
                 className="w-full rounded-xl border border-border bg-background px-3 py-2 text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-primary/30"
               />
             ) : null}
@@ -952,7 +954,7 @@ export function WorkflowTimeline({
               <button
                 type="button"
                 onClick={handleRevert}
-                disabled={reverting || (requireRevertReason && !revertReason.trim())}
+                disabled={reverting}
                 className="flex-1 rounded-xl bg-destructive px-5 py-2.5 text-sm font-semibold text-destructive-foreground shadow-soft transition-all duration-200 hover:-translate-y-0.5 hover:shadow-lift disabled:pointer-events-none disabled:opacity-60"
               >
                 {reverting ? 'Reverting…' : 'Revert'}
@@ -1698,6 +1700,15 @@ function StructuredReviewInfoRequest({
       ) : null}
     </>
   )
+}
+
+/** Under HR's short summary: the latest run's task rows (Done / Warning / …), exactly as the
+ * department sees them on its Tasks card, so HR can check them before verifying. */
+function StructuredReviewTasks({ url }: { url: string }) {
+  const { user } = useAuth()
+  const { data } = useSWR<{ latest: AiVerificationLog | null }>(user ? url : null, authedFetcher(user?.email))
+  if (!data?.latest) return null
+  return <AiReviewTaskList tasks={data.latest.tasks} onOpenLink={(link) => openAuthedLink(link, user?.email)} />
 }
 
 /** HR's View Details for a structured AI review: the same full log the department reviewed, read-only. */

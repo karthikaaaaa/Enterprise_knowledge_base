@@ -1,6 +1,6 @@
 'use client'
 
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import useSWR from 'swr'
 import { AlertTriangle, Check, ChevronDown, FileSignature, Loader2, ScrollText, ShieldCheck } from 'lucide-react'
 import { cn } from '@/lib/utils'
@@ -46,9 +46,23 @@ type AgreementResponse = {
 export function AgreementPanel({ workflowId, readOnly = false, onCreated }: { workflowId: string; readOnly?: boolean; onCreated?: () => void }) {
   const { user } = useAuth()
   const url = `/api/workflows/${workflowId}/steps/legal_verification/agreement`
-  const { data, error, isLoading, mutate } = useSWR<AgreementResponse>(user ? url : null, authedFetcher(user?.email))
+  // While an issued agreement waits on the employee, poll so Legal sees the signature without reloading.
+  const { data, error, isLoading, mutate } = useSWR<AgreementResponse>(user ? url : null, authedFetcher(user?.email), {
+    refreshInterval: (latest) => (!readOnly && latest?.record && !latest.record.signedAt ? 10000 : 0),
+  })
   const [pending, setPending] = useState(false)
   const [actionError, setActionError] = useState<string | null>(null)
+
+  // When the signature lands, refresh the AI log and the sign-off pack draft it unblocks.
+  const signedAt = data?.record?.signedAt ?? null
+  const seenUnsigned = useRef(false)
+  useEffect(() => {
+    if (data?.record && !signedAt) seenUnsigned.current = true
+    else if (signedAt && seenUnsigned.current) {
+      seenUnsigned.current = false
+      onCreated?.()
+    }
+  }, [data?.record, signedAt, onCreated])
 
   if (isLoading) return <p className="text-xs text-muted-foreground">Loading agreement…</p>
   if (error || !data) return <p className="text-xs font-medium text-destructive">{error?.message ?? 'Could not load the agreement'}</p>
@@ -174,7 +188,6 @@ export function EmployeeAgreementSignCard({ workflowId }: { workflowId: string }
   const { user } = useAuth()
   const url = `/api/workflows/${workflowId}/steps/legal_verification/agreement/sign`
   const { data, mutate } = useSWR<SignResponse>(user ? url : null, authedFetcher(user?.email))
-  const [signedName, setSignedName] = useState('')
   const [consent, setConsent] = useState(false)
   const [pending, setPending] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -199,7 +212,7 @@ export function EmployeeAgreementSignCard({ workflowId }: { workflowId: string }
     setPending(true)
     setError(null)
     try {
-      await authedPost(url, user?.email, { agreement_id: agreement.id, signed_name: signedName, consent })
+      await authedPost(url, user?.email, { agreement_id: agreement.id, consent })
       setSigned(true)
       await mutate()
     } catch (err) {
@@ -213,33 +226,22 @@ export function EmployeeAgreementSignCard({ workflowId }: { workflowId: string }
     <div className="space-y-4 rounded-3xl border border-yellow-ink/20 bg-yellow-soft p-5 shadow-soft">
       <div>
         <p className="text-sm font-semibold text-foreground">Legal needs you to sign your confidentiality agreement</p>
-        <p className="mt-1 text-xs text-muted-foreground">Read the agreement, then sign by typing your full legal name exactly as it appears in your employee details.</p>
+        <p className="mt-1 text-xs text-muted-foreground">Read the agreement, then accept all terms to sign it. Your signature is recorded under the legal name in your employee details.</p>
       </div>
       <AgreementText title={agreement.title} version={agreement.version} body={agreement.body} defaultOpen />
-      <label className="block space-y-1 text-xs font-semibold text-foreground">
-        Full legal name
-        <input
-          type="text"
-          autoComplete="off"
-          value={signedName}
-          onChange={(e) => setSignedName(e.target.value)}
-          placeholder="Type your full legal name"
-          className="w-full rounded-xl border border-border bg-background px-3 py-2 text-sm font-normal text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-primary/30 sm:max-w-sm"
-        />
-      </label>
       <label className="flex items-start gap-2 text-sm text-foreground">
         <input type="checkbox" checked={consent} onChange={(e) => setConsent(e.target.checked)} className="mt-0.5 h-4 w-4 rounded border-border accent-primary" />
-        I have read and agree to the terms of this agreement.
+        I have read and agree to all the terms of this agreement.
       </label>
       <div className="flex flex-wrap items-center gap-3">
         <button
           type="button"
           onClick={sign}
-          disabled={pending || !consent || !signedName.trim()}
+          disabled={pending || !consent}
           className="inline-flex items-center gap-1.5 rounded-xl bg-primary px-3 py-2 text-xs font-semibold text-primary-foreground shadow-soft disabled:pointer-events-none disabled:opacity-50"
         >
           {pending ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <FileSignature className="h-3.5 w-3.5" />}
-          Sign agreement
+          Accept all terms
         </button>
         {error ? <p className="text-xs font-medium text-destructive">{error}</p> : null}
       </div>

@@ -1,4 +1,5 @@
 import { GoogleGenAI } from '@google/genai'
+import { GEMINI_REQUEST_OPTIONS } from '@/lib/gemini-request-options'
 import { saveFile, deleteFile } from '@/lib/storage'
 import { addDocument, deleteDocument, type StoredDocument } from '@/lib/document-store'
 import { deleteChunksForDocument } from '@/lib/chunk-store'
@@ -71,7 +72,7 @@ async function compileProfileMarkdown(input: EmployeeProfileInput): Promise<stri
       system_instruction: SYSTEM_PROMPT,
       input: `New employee profile data:\n\n${JSON.stringify(profileData, null, 2)}`,
       generation_config: { max_output_tokens: 1024 },
-    })
+    }, GEMINI_REQUEST_OPTIONS)
 
     const text = response.output_text?.trim()
     return text || fallbackMarkdown(input)

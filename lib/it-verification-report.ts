@@ -1,4 +1,5 @@
 import { GoogleGenAI } from '@google/genai'
+import { GEMINI_REQUEST_OPTIONS } from '@/lib/gemini-request-options'
 
 const SYSTEM_PROMPT =
   'You are an IT operations assistant giving final sign-off confirmation for a new employee. Using ' +
@@ -42,7 +43,7 @@ async function compileSummary(input: ItVerificationInput): Promise<string> {
       system_instruction: SYSTEM_PROMPT,
       input: `IT verification data:\n\n${JSON.stringify(data, null, 2)}`,
       generation_config: { max_output_tokens: 1024 },
-    })
+    }, GEMINI_REQUEST_OPTIONS)
 
     const text = response.output_text?.trim()
     return text || fallbackSummary(input)

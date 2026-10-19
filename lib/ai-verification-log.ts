@@ -1,5 +1,6 @@
 import crypto from 'node:crypto'
 import { GoogleGenAI } from '@google/genai'
+import { GEMINI_REQUEST_OPTIONS } from '@/lib/gemini-request-options'
 
 /**
  * Structured, auditable AI review log for "AI pre-check, then department Verify" steps.
@@ -259,7 +260,7 @@ export const geminiNarrativeGenerator: NarrativeGenerator = async (systemPrompt,
     system_instruction: systemPrompt,
     input: userInput,
     generation_config: { max_output_tokens: 4096, thinking_level: 'low' },
-  })
+  }, GEMINI_REQUEST_OPTIONS)
   if (response.status !== 'completed') throw new Error(`interaction ended with status '${response.status}'`)
   return { text: response.output_text ?? '', model: GEMINI_MODEL }
 }

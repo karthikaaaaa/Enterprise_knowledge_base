@@ -296,6 +296,18 @@ export function AiReviewLog({
   )
 }
 
+/** Just the itemized task rows (Done / Warning / …) — HR's timeline card shows these under the
+ * short summary, the same rows the department reviewed. */
+export function AiReviewTaskList({ tasks, onOpenLink }: { tasks: AiLogTask[]; onOpenLink?: (link: string) => void }) {
+  return (
+    <div className="space-y-2">
+      {tasks.map((task) => (
+        <TaskSection key={task.id} task={task} onOpenLink={onOpenLink} />
+      ))}
+    </div>
+  )
+}
+
 /** Verify / Send back. A 'ready' run verifies with one click; anything flagged needs the
  * acknowledgement checkbox and a comment first (the server enforces the same rule). */
 export function AiReviewDecision({

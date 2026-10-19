@@ -11,6 +11,7 @@ import {
   AiReviewDecision,
   AiReviewLog,
   AiReviewShortSummary,
+  AiReviewTaskList,
   openAuthedLink,
   type AiReviewInfo,
   type AiRunHistoryItem,
@@ -332,17 +333,20 @@ function RenotifyButton({ workflowId, stepKey }: { workflowId: string; stepKey: 
 
 type RunsResponse = { latest: AiVerificationLog | null; review: AiReviewInfo | null; history: AiRunHistoryItem[] }
 
-/** HR's view of an offboarding AI step: short summary, with the read-only full log on demand. */
-function ReviewSummaryPanel({ workflowId, stepKey, badgeLabel }: { workflowId: string; stepKey: string; badgeLabel: string }) {
+/** HR's view of an offboarding AI step: short summary, with the read-only full log on demand.
+ * `showTasks` (Finance Settlement, Legal Clearance) also lists the task rows under the summary,
+ * exactly as the department sees them, so HR can check them before verifying. */
+function ReviewSummaryPanel({ workflowId, stepKey, badgeLabel, showTasks = false }: { workflowId: string; stepKey: string; badgeLabel: string; showTasks?: boolean }) {
   const { user } = useAuth()
   const [showFull, setShowFull] = useState(false)
   const base = `/api/workflows/${workflowId}/steps/${stepKey}/runs`
   const { data: summary } = useSWR<{ latest: AiLogHrSummary | null; review: AiReviewInfo | null }>(user ? base : null, authedFetcher(user?.email))
-  const { data: full } = useSWR<RunsResponse>(user && showFull ? `${base}?view=full` : null, authedFetcher(user?.email))
+  const { data: full } = useSWR<RunsResponse>(user && (showFull || showTasks) ? `${base}?view=full` : null, authedFetcher(user?.email))
   if (!summary?.latest) return null
   return (
     <div className="space-y-2">
       <AiReviewShortSummary summary={summary.latest} review={summary.review} badgeLabel={badgeLabel} />
+      {showTasks && !showFull && full?.latest ? <AiReviewTaskList tasks={full.latest.tasks} onOpenLink={(link) => openAuthedLink(link, user?.email)} /> : null}
       <button type="button" onClick={() => setShowFull((v) => !v)} className="text-xs font-semibold text-blue-ink hover:underline">
         {showFull ? 'Hide full log' : 'Show full log (read-only)'}
       </button>
@@ -580,14 +584,14 @@ export function OffboardingHrStepPanel({
     case 'finance_settlement':
       return (
         <div className="space-y-2">
-          <ReviewSummaryPanel workflowId={workflowId} stepKey={stepKey} badgeLabel="Settlement" />
+          <ReviewSummaryPanel workflowId={workflowId} stepKey={stepKey} badgeLabel="Settlement" showTasks />
           {renotify}
         </div>
       )
     case 'legal_clearance':
       return (
         <div className="space-y-2">
-          <ReviewSummaryPanel workflowId={workflowId} stepKey={stepKey} badgeLabel="Legal clearance" />
+          <ReviewSummaryPanel workflowId={workflowId} stepKey={stepKey} badgeLabel="Legal clearance" showTasks />
           {renotify}
         </div>
       )

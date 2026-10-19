@@ -1,4 +1,5 @@
 import { GoogleGenAI } from '@google/genai'
+import { GEMINI_REQUEST_OPTIONS } from '@/lib/gemini-request-options'
 import { getFile } from '@/lib/storage'
 import { extractText } from '@/lib/text-extraction'
 import { chunkText } from '@/lib/chunking'
@@ -54,6 +55,8 @@ const SYSTEM_PROMPT =
 // matches score ~0.45-0.55, unrelated ones ~0.02-0.05 with the MiniLM embedding model).
 const MIN_RELEVANCE_SCORE = 0.3
 
+const CHAT_FALLBACK_MODEL = 'gemini-3.5-flash-lite'
+
 /** `allowedDocumentIds` scopes retrieval to the documents the caller is allowed to see (see the
  * chat route) — omitted means the whole library, as before. */
 export async function answerQuestion(question: string, allowedDocumentIds?: Set<string>): Promise<ChatAnswer> {
@@ -81,12 +84,26 @@ export async function answerQuestion(question: string, allowedDocumentIds?: Set<
     .join('\n\n')
 
   const client = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY })
-  const response = await client.interactions.create({
-    model: 'gemini-3.6-flash',
-    system_instruction: SYSTEM_PROMPT,
-    input: `Document excerpts:\n\n${contextBlocks}\n\nQuestion: ${question}`,
-    generation_config: { max_output_tokens: 1024 },
-  })
+  // The primary model's free-tier quota (20 requests/day) is shared with the workflow automation's
+  // AI steps and runs out fast; on any failure (usually a 429) retry once on the lite model, which
+  // has its own separate quota.
+  let response
+  try {
+    response = await client.interactions.create({
+      model: 'gemini-3.6-flash',
+      system_instruction: SYSTEM_PROMPT,
+      input: `Document excerpts:\n\n${contextBlocks}\n\nQuestion: ${question}`,
+      generation_config: { max_output_tokens: 1024 },
+    }, GEMINI_REQUEST_OPTIONS)
+  } catch (error) {
+    console.error('[v0] Chat primary model failed, falling back to lite model:', error)
+    response = await client.interactions.create({
+      model: CHAT_FALLBACK_MODEL,
+      system_instruction: SYSTEM_PROMPT,
+      input: `Document excerpts:\n\n${contextBlocks}\n\nQuestion: ${question}`,
+      generation_config: { max_output_tokens: 1024 },
+    }, GEMINI_REQUEST_OPTIONS)
+  }
 
   const answer = response.output_text ?? ''
 

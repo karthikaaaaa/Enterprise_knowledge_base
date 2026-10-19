@@ -1,4 +1,5 @@
 import { GoogleGenAI } from '@google/genai'
+import { GEMINI_REQUEST_OPTIONS } from '@/lib/gemini-request-options'
 
 /** Everything finance_verification / legal_verification have to go on by the time they're
  * notified — the employee's own submission, the documents they actually uploaded (fields only,
@@ -128,7 +129,7 @@ async function compileSummary(systemPrompt: string, label: string, input: Depart
       // was observed truncating the reply mid-sentence. Low thinking + a bigger cap, and anything
       // short of a 'completed' interaction falls back rather than storing a half-finished summary.
       generation_config: { max_output_tokens: 4096, thinking_level: 'low' },
-    })
+    }, GEMINI_REQUEST_OPTIONS)
     const text = response.output_text?.trim()
     if (response.status !== 'completed') {
       console.error(`[v0] Gemini ${label} summary ended with status '${response.status}', using fallback text`)

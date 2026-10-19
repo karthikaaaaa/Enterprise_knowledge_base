@@ -1,7 +1,6 @@
 import { NextResponse } from 'next/server'
 import { getCaller } from '@/lib/server-auth'
 import { revertStep, type RevertError } from '@/lib/workflow-revert'
-import { getWorkflow } from '@/lib/workflow-store'
 
 /** Server-side authority for whether the Revert control exists at all — mirrors
  * NEXT_PUBLIC_ENABLE_STEP_DEV_CONTROLS, which only decides whether the button renders client-side.
@@ -38,13 +37,10 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
   }
 
   const { id, stepId } = await params
-  // Optional body { reason }. Offboarding reverts require one (it's audit-logged and sent to
-  // everyone affected); onboarding keeps working without a body, exactly as before.
+  // Optional body { reason } — when given it's audit-logged and, for offboarding, sent to everyone
+  // affected. Reverting works without one.
   const body = (await request.json().catch(() => null)) as { reason?: unknown } | null
   const reason = typeof body?.reason === 'string' && body.reason.trim() ? body.reason.trim().slice(0, 1000) : null
-  if (!reason && getWorkflow(id)?.type === 'offboarding') {
-    return NextResponse.json({ error: 'A reason is required to revert an offboarding step' }, { status: 400 })
-  }
   const result = await revertStep(id, stepId, caller.user.id, reason)
   if (!result.ok) {
     // failedAt names the operation that threw (also logged server-side with the full stack).
